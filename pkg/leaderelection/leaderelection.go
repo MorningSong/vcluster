@@ -2,11 +2,15 @@ package leaderelection
 
 import (
 	"context"
-	context2 "github.com/loft-sh/vcluster/cmd/vcluster/context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/telemetry"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -14,12 +18,10 @@ import (
 	"k8s.io/client-go/tools/leaderelection"
 	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/klog"
-	"os"
-	"time"
+	"k8s.io/klog/v2"
 )
 
-func StartLeaderElection(ctx *context2.ControllerContext, scheme *runtime.Scheme, run func() error) error {
+func StartLeaderElection(ctx *synccontext.ControllerContext, scheme *runtime.Scheme, run func() error) error {
 	localConfig := ctx.LocalManager.GetConfig()
 
 	// create the event recorder
@@ -29,7 +31,7 @@ func StartLeaderElection(ctx *context2.ControllerContext, scheme *runtime.Scheme
 	}
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(func(format string, args ...interface{}) { klog.Infof(format, args...) })
-	eventBroadcaster.StartRecordingToSink(&clientv1.EventSinkImpl{Interface: recorderClient.CoreV1().Events(ctx.CurrentNamespace)})
+	eventBroadcaster.StartRecordingToSink(&clientv1.EventSinkImpl{Interface: recorderClient.CoreV1().Events(ctx.Config.WorkloadNamespace)})
 	recorder := eventBroadcaster.NewRecorder(scheme, corev1.EventSource{Component: "vcluster"})
 
 	// create the leader election client
@@ -45,26 +47,29 @@ func StartLeaderElection(ctx *context2.ControllerContext, scheme *runtime.Scheme
 	}
 
 	// Lock required for leader election
-	rl := resourcelock.ConfigMapLock{
-		ConfigMapMeta: metav1.ObjectMeta{
-			Namespace: ctx.CurrentNamespace,
-			Name:      translate.SafeConcatName("vcluster", translate.Suffix, "controller"),
-		},
-		Client: leaderElectionClient.CoreV1(),
-		LockConfig: resourcelock.ResourceLockConfig{
+	rl, err := resourcelock.New(
+		resourcelock.LeasesResourceLock,
+		ctx.Config.WorkloadNamespace,
+		translate.SafeConcatName("vcluster", translate.VClusterName, "controller"),
+		leaderElectionClient.CoreV1(),
+		leaderElectionClient.CoordinationV1(),
+		resourcelock.ResourceLockConfig{
 			Identity:      id + "-external-vcluster-controller",
 			EventRecorder: recorder,
 		},
+	)
+	if err != nil {
+		return err
 	}
 
 	// try and become the leader and start controller manager loops
-	leaderelection.RunOrDie(ctx.Context, leaderelection.LeaderElectionConfig{
-		Lock:          &rl,
-		LeaseDuration: time.Duration(ctx.Options.LeaseDuration) * time.Second,
-		RenewDeadline: time.Duration(ctx.Options.RenewDeadline) * time.Second,
-		RetryPeriod:   time.Duration(ctx.Options.RetryPeriod) * time.Second,
+	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+		Lock:          rl,
+		LeaseDuration: time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.LeaseDuration) * time.Second,
+		RenewDeadline: time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.RenewDeadline) * time.Second,
+		RetryPeriod:   time.Duration(ctx.Config.ControlPlane.StatefulSet.HighAvailability.RetryPeriod) * time.Second,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) {
+			OnStartedLeading: func(_ context.Context) {
 				klog.Info("Acquired leadership and run vcluster in leader mode")
 
 				// start vcluster in leader mode
@@ -75,6 +80,11 @@ func StartLeaderElection(ctx *context2.ControllerContext, scheme *runtime.Scheme
 			},
 			OnStoppedLeading: func() {
 				klog.Info("leader election lost")
+
+				// vcluster_error
+				telemetry.CollectorControlPlane.RecordError(ctx, ctx.Config, telemetry.WarningSeverity, fmt.Errorf("leader election lost"))
+				telemetry.CollectorControlPlane.Flush()
+
 				os.Exit(1)
 			},
 		},

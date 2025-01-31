@@ -1,51 +1,20 @@
 package poddisruptionbudgets
 
 import (
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
 	policyv1 "k8s.io/api/policy/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/types"
 )
 
-func (pdb *pdbSyncer) translate(vObj *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
-	newPDB := pdb.TranslateMetadata(vObj).(*policyv1.PodDisruptionBudget)
-	if newPDB.Spec.Selector != nil {
-		newPDB.Spec.Selector = translator.TranslateLabelSelector(newPDB.Spec.Selector)
-	}
+func (s *pdbSyncer) translate(ctx *synccontext.SyncContext, vObj *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	newPDB := translate.HostMetadata(vObj, s.VirtualToHost(ctx, types.NamespacedName{Name: vObj.GetName(), Namespace: vObj.GetNamespace()}, vObj))
+	newPDB.Spec.Selector = translate.HostLabelSelector(newPDB.Spec.Selector)
 	return newPDB
 }
 
-func (pdb *pdbSyncer) translateUpdate(pObj, vObj *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
-	var updated *policyv1.PodDisruptionBudget
-
-	// check max available and min available in spec
-	if !equality.Semantic.DeepEqual(vObj.Spec.MaxUnavailable, pObj.Spec.MaxUnavailable) ||
-		!equality.Semantic.DeepEqual(vObj.Spec.MinAvailable, pObj.Spec.MinAvailable) {
-		updated = newIfNil(updated, pObj)
-		updated.Spec.MaxUnavailable = vObj.Spec.MaxUnavailable
-		updated.Spec.MinAvailable = vObj.Spec.MinAvailable
-	}
-
-	// check annotations
-	changed, updatedAnnotations, updatedLabels := pdb.TranslateMetadataUpdate(vObj, pObj)
-	if changed {
-		updated = newIfNil(updated, pObj)
-		updated.Annotations = updatedAnnotations
-		updated.Labels = updatedLabels
-	}
-
-	// check LabelSelector
-	vObjLabelSelector := translator.TranslateLabelSelector(vObj.Spec.Selector)
-	if !equality.Semantic.DeepEqual(vObjLabelSelector, pObj.Spec.Selector) {
-		updated = newIfNil(updated, pObj)
-		updated.Spec.Selector = vObjLabelSelector
-	}
-
-	return updated
-}
-
-func newIfNil(updated *policyv1.PodDisruptionBudget, pObj *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
-	if updated == nil {
-		return pObj.DeepCopy()
-	}
-	return updated
+func (s *pdbSyncer) translateUpdate(pObj, vObj *policyv1.PodDisruptionBudget) {
+	pObj.Spec.MaxUnavailable = vObj.Spec.MaxUnavailable
+	pObj.Spec.MinAvailable = vObj.Spec.MinAvailable
+	pObj.Spec.Selector = translate.HostLabelSelector(vObj.Spec.Selector)
 }

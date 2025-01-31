@@ -2,23 +2,33 @@ package pods
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"github.com/loft-sh/vcluster/pkg/controllers/resources/pods/token"
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/patcher"
+	"github.com/loft-sh/vcluster/pkg/pro"
+	"github.com/loft-sh/vcluster/pkg/syncer"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/syncer/translator"
+	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/klog/v2"
 
 	translatepods "github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
-	"github.com/loft-sh/vcluster/pkg/util/loghelper"
 	"github.com/loft-sh/vcluster/pkg/util/toleration"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -26,7 +36,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 var (
@@ -35,79 +44,100 @@ var (
 	zero                              = int64(0)
 )
 
-func New(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
 	virtualClusterClient, err := kubernetes.NewForConfig(ctx.VirtualManager.GetConfig())
+	if err != nil {
+		return nil, err
+	}
+	physicalClusterClient, err := kubernetes.NewForConfig(ctx.PhysicalManager.GetConfig())
 	if err != nil {
 		return nil, err
 	}
 
 	// parse node selector
 	var nodeSelector *metav1.LabelSelector
-	if ctx.Options.EnforceNodeSelector && ctx.Options.NodeSelector != "" {
-		nodeSelector, err = metav1.ParseToLabelSelector(ctx.Options.NodeSelector)
-		if err != nil {
-			return nil, errors.Wrap(err, "parse node selector")
-		} else if len(nodeSelector.MatchExpressions) > 0 {
-			return nil, errors.New("match expressions in the node selector are not supported")
-		} else if len(nodeSelector.MatchLabels) == 0 {
-			return nil, errors.New("at least one label=value pair has to be defined in the label selector")
+	if len(ctx.Config.Sync.FromHost.Nodes.Selector.Labels) > 0 {
+		nodeSelector = &metav1.LabelSelector{
+			MatchLabels: ctx.Config.Sync.FromHost.Nodes.Selector.Labels,
 		}
 	}
+
+	// parse tolerations
 	var tolerations []*corev1.Toleration
-	if len(ctx.Options.Tolerations) > 0 {
-		for _, t := range ctx.Options.Tolerations {
-			toleration, _ := toleration.ParseToleration(t)
-			tolerations = append(tolerations, &toleration)
+	if len(ctx.Config.Sync.ToHost.Pods.EnforceTolerations) > 0 {
+		for _, t := range ctx.Config.Sync.ToHost.Pods.EnforceTolerations {
+			tol, err := toleration.ParseToleration(t)
+			if err == nil {
+				tolerations = append(tolerations, &tol)
+			}
 		}
 	}
+
+	// get pods mapper
+	podsMapper, err := ctx.Mappings.ByGVK(mappings.Pods())
+	if err != nil {
+		return nil, err
+	}
+
 	// create new namespaced translator
-	namespacedTranslator := translator.NewNamespacedTranslator(ctx, "pod", &corev1.Pod{})
+	genericTranslator := translator.NewGenericTranslator(ctx, "pod", &corev1.Pod{}, podsMapper)
 
 	// create pod translator
-	podTranslator, err := translatepods.NewTranslator(ctx, namespacedTranslator.EventRecorder())
+	podTranslator, err := translatepods.NewTranslator(ctx, genericTranslator.EventRecorder())
 	if err != nil {
 		return nil, errors.Wrap(err, "create pod translator")
 	}
 
 	return &podSyncer{
-		NamespacedTranslator: namespacedTranslator,
+		GenericTranslator: genericTranslator,
+		Importer:          pro.NewImporter(podsMapper),
 
-		serviceName:          ctx.Options.ServiceName,
-		virtualClusterClient: virtualClusterClient,
+		serviceName:     ctx.Config.WorkloadService,
+		enableScheduler: ctx.Config.ControlPlane.Advanced.VirtualScheduler.Enabled,
+		fakeKubeletIPs:  ctx.Config.Networking.Advanced.ProxyKubelets.ByIP,
 
-		podTranslator: podTranslator,
-		nodeSelector:  nodeSelector,
-		tolerations:   tolerations,
+		virtualClusterClient:  virtualClusterClient,
+		physicalClusterClient: physicalClusterClient,
+		physicalClusterConfig: ctx.PhysicalManager.GetConfig(),
+		podTranslator:         podTranslator,
+		nodeSelector:          nodeSelector,
+		tolerations:           tolerations,
 
-		podSecurityStandard: ctx.Options.EnforcePodSecurityStandard,
+		podSecurityStandard: ctx.Config.Policies.PodSecurityStandard,
 	}, nil
 }
 
 type podSyncer struct {
-	translator.NamespacedTranslator
+	syncertypes.GenericTranslator
+	syncertypes.Importer
 
-	serviceName string
+	serviceName     string
+	enableScheduler bool
+	fakeKubeletIPs  bool
 
-	podTranslator        translatepods.Translator
-	virtualClusterClient kubernetes.Interface
-
-	nodeSelector *metav1.LabelSelector
-	tolerations  []*corev1.Toleration
+	podTranslator         translatepods.Translator
+	virtualClusterClient  kubernetes.Interface
+	physicalClusterClient kubernetes.Interface
+	physicalClusterConfig *rest.Config
+	nodeSelector          *metav1.LabelSelector
+	tolerations           []*corev1.Toleration
 
 	podSecurityStandard string
 }
 
-var _ syncer.IndicesRegisterer = &podSyncer{}
+var _ syncertypes.OptionsProvider = &podSyncer{}
 
-func (s *podSyncer) RegisterIndices(ctx *synccontext.RegisterContext) error {
-	return s.NamespacedTranslator.RegisterIndices(ctx)
+func (s *podSyncer) Options() *syncertypes.Options {
+	return &syncertypes.Options{
+		ObjectCaching: true,
+	}
 }
 
-var _ syncer.ControllerModifier = &podSyncer{}
+var _ syncertypes.ControllerModifier = &podSyncer{}
 
-func (s *podSyncer) ModifyController(ctx *synccontext.RegisterContext, builder *builder.Builder) (*builder.Builder, error) {
+func (s *podSyncer) ModifyController(registerContext *synccontext.RegisterContext, builder *builder.Builder) (*builder.Builder, error) {
 	eventHandler := handler.Funcs{
-		UpdateFunc: func(e event.UpdateEvent, q workqueue.RateLimitingInterface) {
+		UpdateFunc: func(ctx context.Context, e event.UpdateEvent, q workqueue.TypedRateLimitingInterface[ctrl.Request]) {
 			// no need to reconcile pods if namespace labels didn't change
 			if reflect.DeepEqual(e.ObjectNew.GetLabels(), e.ObjectOld.GetLabels()) {
 				return
@@ -115,10 +145,9 @@ func (s *podSyncer) ModifyController(ctx *synccontext.RegisterContext, builder *
 
 			ns := e.ObjectNew.GetName()
 			pods := &corev1.PodList{}
-			err := ctx.VirtualManager.GetClient().List(context.TODO(), pods, client.InNamespace(ns))
+			err := registerContext.VirtualManager.GetClient().List(ctx, pods, client.InNamespace(ns))
 			if err != nil {
-				log := loghelper.New("pods-syncer-ns-watch-handler")
-				log.Infof("failed to list pods in the %s namespace when handling namespace update: %v", ns, err)
+				klog.FromContext(ctx).Info("failed to list pods in the namespace when handling namespace update", "namespace", ns, "error", err)
 				return
 			}
 			for _, pod := range pods.Items {
@@ -130,28 +159,29 @@ func (s *podSyncer) ModifyController(ctx *synccontext.RegisterContext, builder *
 		},
 	}
 
-	return builder.Watches(&source.Kind{Type: &corev1.Namespace{}}, eventHandler), nil
+	return builder.Watches(&corev1.Namespace{}, eventHandler), nil
 }
 
-var _ syncer.Syncer = &podSyncer{}
+var _ syncertypes.Syncer = &podSyncer{}
 
-func (s *podSyncer) SyncDown(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
-	vPod := vObj.(*corev1.Pod)
-	if vPod.DeletionTimestamp != nil {
+func (s *podSyncer) Syncer() syncertypes.Sync[client.Object] {
+	return syncer.ToGenericSyncer[*corev1.Pod](s)
+}
+
+func (s *podSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.SyncToHostEvent[*corev1.Pod]) (ctrl.Result, error) {
+	// in some scenarios it is possible that the pod was already started and the physical pod
+	// was deleted without vcluster's knowledge. In this case we are deleting the virtual pod
+	// as well, to avoid conflicts with nodes if we would resync the same pod to the host cluster again.
+	if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil || event.Virtual.Status.StartTime != nil {
 		// delete pod immediately
-		ctx.Log.Infof("delete pod %s/%s immediately, because it is being deleted & there is no physical pod", vPod.Namespace, vPod.Name)
-		err := ctx.VirtualClient.Delete(ctx.Context, vPod, &client.DeleteOptions{
+		return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.HostOld, "pod is being deleted & there is no physical pod", &client.DeleteOptions{
 			GracePeriodSeconds: &zero,
 		})
-		if kerrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
 	}
 
 	// validate virtual pod before syncing it to the host cluster
 	if s.podSecurityStandard != "" {
-		valid, err := s.isPodSecurityStandardsValid(ctx.Context, vPod, ctx.Log)
+		valid, err := s.isPodSecurityStandardsValid(ctx, event.Virtual, ctx.Log)
 		if err != nil {
 			return ctrl.Result{}, err
 		} else if !valid {
@@ -159,15 +189,17 @@ func (s *podSyncer) SyncDown(ctx *synccontext.SyncContext, vObj client.Object) (
 		}
 	}
 
-	pPod, err := s.translate(ctx, vPod)
+	// translate the pod
+	pPod, err := s.translate(ctx, event.Virtual)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
 	// ensure tolerations
-	for _, toleration := range s.tolerations {
-		pPod.Spec.Tolerations = append(pPod.Spec.Tolerations, *toleration)
+	for _, tol := range s.tolerations {
+		pPod.Spec.Tolerations = append(pPod.Spec.Tolerations, *tol)
 	}
+
 	// ensure node selector
 	if s.nodeSelector != nil {
 		// 2 cases:
@@ -182,96 +214,100 @@ func (s *podSyncer) SyncDown(ctx *synccontext.SyncContext, vObj client.Object) (
 			}
 		} else {
 			// make sure the node does exist in the virtual cluster
-			err = ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{Name: pPod.Spec.NodeName}, &corev1.Node{})
+			err = ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pPod.Spec.NodeName}, &corev1.Node{})
 			if err != nil {
 				if !kerrors.IsNotFound(err) {
 					return ctrl.Result{}, err
 				}
 
-				s.EventRecorder().Eventf(vPod, "Warning", "SyncWarning", "Given nodeName %s does not exist in virtual cluster", pPod.Spec.NodeName)
+				s.EventRecorder().Eventf(event.Virtual, "Warning", "SyncWarning", "Given nodeName %s does not exist in virtual cluster", pPod.Spec.NodeName)
 				return ctrl.Result{RequeueAfter: time.Second * 15}, nil
 			}
 		}
 	}
 
-	return s.SyncDownCreate(ctx, vPod, pPod)
-}
+	if s.enableScheduler {
+		// if scheduler is enabled we only sync if the pod has a node name
+		if pPod.Spec.NodeName == "" {
+			return ctrl.Result{}, nil
+		}
 
-func (s *podSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Object, vObj client.Object) (ctrl.Result, error) {
-	vPod := vObj.(*corev1.Pod)
-	pPod := pObj.(*corev1.Pod)
-
-	// should pod get deleted?
-	if pPod.DeletionTimestamp != nil {
-		if vPod.DeletionTimestamp == nil {
-			gracePeriod := minimumGracePeriodInSeconds
-			if vPod.Spec.TerminationGracePeriodSeconds != nil {
-				gracePeriod = *vPod.Spec.TerminationGracePeriodSeconds
-			}
-
-			ctx.Log.Infof("delete virtual pod %s/%s, because the physical pod is being deleted", vPod.Namespace, vPod.Name)
-			if err := ctx.VirtualClient.Delete(ctx.Context, vPod, &client.DeleteOptions{GracePeriodSeconds: &gracePeriod}); err != nil {
+		if s.fakeKubeletIPs {
+			nodeIP, err := s.getNodeIP(ctx, pPod.Spec.NodeName)
+			if err != nil {
 				return ctrl.Result{}, err
 			}
-		} else if *vPod.DeletionGracePeriodSeconds != *pPod.DeletionGracePeriodSeconds {
-			ctx.Log.Infof("delete virtual pPod %s/%s with grace period seconds %v", vPod.Namespace, vPod.Name, *pPod.DeletionGracePeriodSeconds)
-			if err := ctx.VirtualClient.Delete(ctx.Context, vPod, &client.DeleteOptions{GracePeriodSeconds: pPod.DeletionGracePeriodSeconds, Preconditions: metav1.NewUIDPreconditions(string(vPod.UID))}); err != nil {
+
+			pPod.Annotations[translatepods.HostIPAnnotation] = nodeIP
+			pPod.Annotations[translatepods.HostIPsAnnotation] = nodeIP
+		}
+	}
+
+	err = pro.ApplyPatchesHostObject(ctx, nil, pPod, event.Virtual, ctx.Config.Sync.ToHost.Pods.Patches, false)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return patcher.CreateHostObject(ctx, event.Virtual, pPod, s.EventRecorder(), true)
+}
+
+func (s *podSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.Pod]) (_ ctrl.Result, retErr error) {
+	var (
+		err error
+	)
+	// should pod get deleted?
+	if event.Host.DeletionTimestamp != nil {
+		if event.Virtual.DeletionTimestamp == nil {
+			gracePeriod := minimumGracePeriodInSeconds
+			if event.Virtual.Spec.TerminationGracePeriodSeconds != nil {
+				gracePeriod = *event.Virtual.Spec.TerminationGracePeriodSeconds
+			}
+
+			_, err := patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, "physical pod is being deleted", &client.DeleteOptions{GracePeriodSeconds: &gracePeriod})
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+		} else if *event.Virtual.DeletionGracePeriodSeconds != *event.Host.DeletionGracePeriodSeconds {
+			_, err := patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, fmt.Sprintf("with grace period seconds %v", *event.Host.DeletionGracePeriodSeconds), &client.DeleteOptions{GracePeriodSeconds: event.Host.DeletionGracePeriodSeconds, Preconditions: metav1.NewUIDPreconditions(string(event.Virtual.UID))})
+			if err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 
 		return ctrl.Result{}, nil
-	} else if vPod.DeletionTimestamp != nil {
-		ctx.Log.Infof("delete physical pod %s/%s, because virtual pod is being deleted", pPod.Namespace, pPod.Name)
-		err := ctx.PhysicalClient.Delete(ctx.Context, pPod, &client.DeleteOptions{
-			GracePeriodSeconds: vPod.DeletionGracePeriodSeconds,
-			Preconditions:      metav1.NewUIDPreconditions(string(pPod.UID)),
+	} else if event.Virtual.DeletionTimestamp != nil {
+		return patcher.DeleteHostObjectWithOptions(ctx, event.Host, event.Virtual, "virtual pod is being deleted", &client.DeleteOptions{
+			GracePeriodSeconds: event.Virtual.DeletionGracePeriodSeconds,
+			Preconditions:      metav1.NewUIDPreconditions(string(event.Host.UID)),
 		})
-		if kerrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
 	}
 
 	// make sure node exists for pod
-	if pPod.Spec.NodeName != "" {
-		requeue, err := s.ensureNode(ctx, pPod, vPod)
-		if err != nil {
+	if event.Host.Spec.NodeName != "" {
+		requeue, err := s.ensureNode(ctx, event.Host, event.Virtual)
+		if kerrors.IsConflict(err) {
+			ctx.Log.Debugf("conflict binding virtual pod %s/%s", event.Virtual.Namespace, event.Virtual.Name)
+			return ctrl.Result{Requeue: true}, nil
+		} else if err != nil {
 			return ctrl.Result{}, err
 		} else if requeue {
 			return ctrl.Result{Requeue: true}, nil
 		}
-	} else if pPod.Spec.NodeName != "" && vPod.Spec.NodeName != "" && pPod.Spec.NodeName != vPod.Spec.NodeName {
+	} else if event.Host.Spec.NodeName != "" && event.Virtual.Spec.NodeName != "" && event.Host.Spec.NodeName != event.Virtual.Spec.NodeName {
 		// if physical pod nodeName is different from virtual pod nodeName, we delete the virtual one
-		ctx.Log.Infof("delete virtual pod %s/%s, because node name is different between the two", vPod.Namespace, vPod.Name)
-		err := ctx.VirtualClient.Delete(ctx.Context, vPod, &client.DeleteOptions{GracePeriodSeconds: &minimumGracePeriodInSeconds})
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		return ctrl.Result{}, nil
+		return patcher.DeleteVirtualObjectWithOptions(ctx, event.Virtual, event.Host, "node name is different between the two", &client.DeleteOptions{GracePeriodSeconds: &minimumGracePeriodInSeconds})
 	}
 
-	// has status changed?
-	strippedPod := stripHostRewriteContainer(pPod)
-	if !equality.Semantic.DeepEqual(vPod.Status, strippedPod.Status) {
-		newPod := vPod.DeepCopy()
-		newPod.Status = strippedPod.Status
-		ctx.Log.Infof("update virtual pod %s/%s, because status has changed", vPod.Namespace, vPod.Name)
-		err := ctx.VirtualClient.Status().Update(ctx.Context, newPod)
+	if s.fakeKubeletIPs && event.Host.Status.HostIP != "" {
+		err = s.rewriteFakeHostIPAddresses(ctx, event.Host)
 		if err != nil {
-			if !kerrors.IsConflict(err) {
-				s.EventRecorder().Eventf(vObj, "Warning", "SyncError", "Error updating pod: %v", err)
-			}
-
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{}, nil
 	}
 
 	// validate virtual pod before syncing it to the host cluster
 	if s.podSecurityStandard != "" {
-		valid, err := s.isPodSecurityStandardsValid(ctx.Context, vPod, ctx.Log)
+		valid, err := s.isPodSecurityStandardsValid(ctx, event.Virtual, ctx.Log)
 		if err != nil {
 			return ctrl.Result{}, err
 		} else if !valid {
@@ -279,20 +315,88 @@ func (s *podSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Object, vObj 
 		}
 	}
 
-	// update the virtual pod if the spec has changed
-	updatedPod, err := s.translateUpdate(pPod, vPod)
+	// sync ephemeral containers
+	synced, err := s.syncEphemeralContainers(ctx, s.physicalClusterClient, event.Host, event.Virtual)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("sync ephemeral containers: %w", err)
+	} else if synced {
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// set pod owner as sa token
+	err = setSATokenSecretAsOwner(ctx, ctx.PhysicalClient, event.Virtual, event.Host)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 
-	return s.SyncDownUpdate(ctx, vPod, updatedPod)
+	// patch objects
+	patch, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(ctx.Config.Sync.ToHost.Pods.Patches, false))
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("new syncer patcher: %w", err)
+	}
+	defer func() {
+		if err := patch.Patch(ctx, event.Host, event.Virtual); err != nil {
+			retErr = utilerrors.NewAggregate([]error{retErr, err})
+		}
+
+		if retErr != nil {
+			s.EventRecorder().Eventf(event.Virtual, "Warning", "SyncError", "Error syncing: %v", retErr)
+		}
+	}()
+
+	// update the virtual pod if the spec has changed
+	err = s.podTranslator.Diff(ctx, event)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (s *podSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.Pod]) (_ ctrl.Result, retErr error) {
+	if event.VirtualOld != nil || event.Host.DeletionTimestamp != nil {
+		// virtual object is not here anymore, so we delete
+		return patcher.DeleteHostObject(ctx, event.Host, event.VirtualOld, "virtual object was deleted")
+	}
+
+	vPod := translate.VirtualMetadata(event.Host, s.HostToVirtual(ctx, types.NamespacedName{Name: event.Host.GetName(), Namespace: event.Host.GetNamespace()}, event.Host))
+	vPod.Spec.NodeName = ""
+	if !ctx.Config.Sync.ToHost.ServiceAccounts.Enabled {
+		vPod.Spec.ServiceAccountName = ""
+		vPod.Spec.DeprecatedServiceAccount = ""
+	}
+
+	err := pro.ApplyPatchesVirtualObject(ctx, nil, vPod, event.Host, ctx.Config.Sync.ToHost.Pods.Patches, false)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return patcher.CreateVirtualObject(ctx, event.Host, vPod, s.EventRecorder(), true)
+}
+
+func setSATokenSecretAsOwner(ctx *synccontext.SyncContext, pClient client.Client, vObj, pObj *corev1.Pod) error {
+	if !ctx.Config.Sync.ToHost.Pods.UseSecretsForSATokens {
+		return nil
+	}
+
+	secret, err := token.GetSecretIfExists(ctx, pClient, vObj.Name, vObj.Namespace)
+	if err := token.IgnoreAcceptableErrors(err); err != nil {
+		return err
+	} else if secret != nil {
+		// check if owner is vCluster service, if so, modify to pod as owner
+		err := token.SetPodAsOwner(ctx, pObj, pClient, secret)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) (bool, error) {
 	if vObj.Spec.NodeName != pObj.Spec.NodeName && vObj.Spec.NodeName != "" {
 		// node of virtual and physical pod are different, we delete the virtual pod to try to recover from this state
-		ctx.Log.Infof("delete virtual pod %s/%s, because virtual and physical pods have different assigned nodes", vObj.Namespace, vObj.Name)
-		err := ctx.VirtualClient.Delete(ctx.Context, vObj)
+		_, err := patcher.DeleteVirtualObject(ctx, vObj, pObj, "virtual and physical pods have different assigned nodes")
 		if err != nil {
 			return false, err
 		}
@@ -303,7 +407,7 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 	// ensure the node is available in the virtual cluster, if not and we sync the pod to the virtual cluster,
 	// it will get deleted automatically by kubernetes so we ensure the node is synced
 	vNode := &corev1.Node{}
-	err := ctx.VirtualClient.Get(ctx.Context, types.NamespacedName{Name: pObj.Spec.NodeName}, vNode)
+	err := ctx.VirtualClient.Get(ctx, types.NamespacedName{Name: pObj.Spec.NodeName}, vNode)
 	if err != nil {
 		if !kerrors.IsNotFound(err) {
 			ctx.Log.Infof("error retrieving virtual node %s: %v", pObj.Spec.NodeName, err)
@@ -327,7 +431,7 @@ func (s *podSyncer) ensureNode(ctx *synccontext.SyncContext, pObj *corev1.Pod, v
 
 func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.Pod, vObj *corev1.Pod) error {
 	ctx.Log.Infof("bind virtual pod %s/%s to node %s, because node name between physical and virtual is different", vObj.Namespace, vObj.Name, pObj.Spec.NodeName)
-	err := s.virtualClusterClient.CoreV1().Pods(vObj.Namespace).Bind(ctx.Context, &corev1.Binding{
+	err := s.virtualClusterClient.CoreV1().Pods(vObj.Namespace).Bind(ctx, &corev1.Binding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      vObj.Name,
 			Namespace: vObj.Namespace,
@@ -339,28 +443,55 @@ func (s *podSyncer) assignNodeToPod(ctx *synccontext.SyncContext, pObj *corev1.P
 		},
 	}, metav1.CreateOptions{})
 	if err != nil {
-		s.EventRecorder().Eventf(vObj, "Warning", "SyncError", "Error binding pod: %v", err)
+		if !kerrors.IsConflict(err) {
+			s.EventRecorder().Eventf(vObj, "Warning", "SyncError", "Error binding pod: %v", err)
+		}
+		return err
+	}
+
+	// wait until cache is updated
+	vPod := &corev1.Pod{}
+	err = wait.PollUntilContextTimeout(ctx, time.Millisecond*50, time.Second*2, true, func(syncContext context.Context) (done bool, err error) {
+		err = ctx.VirtualClient.Get(syncContext, types.NamespacedName{Namespace: vObj.Namespace, Name: vObj.Name}, vPod)
+		if err != nil {
+			if kerrors.IsNotFound(err) {
+				return true, nil
+			}
+
+			return false, err
+		}
+
+		return vPod.Spec.NodeName != "", nil
+	})
+	if err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func stripHostRewriteContainer(pPod *corev1.Pod) *corev1.Pod {
-	if pPod.Annotations == nil || pPod.Annotations[translatepods.HostsRewrittenAnnotation] != "true" {
-		return pPod
+func (s *podSyncer) rewriteFakeHostIPAddresses(ctx *synccontext.SyncContext, pPod *corev1.Pod) error {
+	nodeIP, err := s.getNodeIP(ctx, pPod.Spec.NodeName)
+	if err != nil {
+		return err
 	}
 
-	newPod := pPod.DeepCopy()
-	newInitContainerStatuses := []corev1.ContainerStatus{}
-	if len(newPod.Status.InitContainerStatuses) > 0 {
-		for _, v := range newPod.Status.InitContainerStatuses {
-			if v.Name == translatepods.HostsRewriteContainerName {
-				continue
-			}
-			newInitContainerStatuses = append(newInitContainerStatuses, v)
-		}
-		newPod.Status.InitContainerStatuses = newInitContainerStatuses
+	pPod.Status.HostIP = nodeIP
+	pPod.Status.HostIPs = []corev1.HostIP{
+		{IP: nodeIP},
 	}
-	return newPod
+
+	return nil
+}
+
+func (s *podSyncer) getNodeIP(ctx *synccontext.SyncContext, name string) (string, error) {
+	serviceName := translate.SafeConcatName(translate.VClusterName, "node", strings.ReplaceAll(name, ".", "-"))
+
+	nodeService := &corev1.Service{}
+	err := ctx.CurrentNamespaceClient.Get(ctx.Context, types.NamespacedName{Name: serviceName, Namespace: ctx.CurrentNamespace}, nodeService)
+	if err != nil && !kerrors.IsNotFound(err) {
+		return "", fmt.Errorf("list services: %w", err)
+	}
+
+	return nodeService.Spec.ClusterIP, nil
 }

@@ -1,34 +1,22 @@
 package cmd
 
 import (
-	"context"
-	"encoding/json"
-	"time"
+	"cmp"
+	"fmt"
 
-	"github.com/loft-sh/vcluster/cmd/vclusterctl/flags"
-	"github.com/loft-sh/vcluster/cmd/vclusterctl/log"
-	"github.com/pkg/errors"
+	"github.com/loft-sh/log"
+	"github.com/loft-sh/vcluster/pkg/cli"
+	"github.com/loft-sh/vcluster/pkg/cli/config"
+	"github.com/loft-sh/vcluster/pkg/cli/flags"
 	"github.com/spf13/cobra"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
-
-// VCluster holds information about a cluster
-type VCluster struct {
-	Name       string
-	Namespace  string
-	Created    time.Time
-	AgeSeconds int
-}
 
 // ListCmd holds the login cmd flags
 type ListCmd struct {
 	*flags.GlobalFlags
+	cli.ListOptions
 
-	log    log.Logger
-	output string
+	log log.Logger
 }
 
 // NewListCmd creates a new command
@@ -41,8 +29,7 @@ func NewListCmd(globalFlags *flags.GlobalFlags) *cobra.Command {
 	cobraCmd := &cobra.Command{
 		Use:   "list",
 		Short: "Lists all virtual clusters",
-		Long: `
-#######################################################
+		Long: `#######################################################
 #################### vcluster list ####################
 #######################################################
 Lists all virtual clusters
@@ -53,93 +40,31 @@ vcluster list --output json
 vcluster list --namespace test
 #######################################################
 	`,
-		Args: cobra.NoArgs,
-		RunE: func(cobraCmd *cobra.Command, args []string) error {
-			return cmd.Run(cobraCmd, args)
+		Args:    cobra.NoArgs,
+		Aliases: []string{"ls"},
+		RunE: func(cobraCmd *cobra.Command, _ []string) error {
+			return cmd.Run(cobraCmd)
 		},
 	}
 
-	cobraCmd.Flags().StringVar(&cmd.output, "output", "table", "Choose the format of the output. [table|json]")
+	cobraCmd.Flags().StringVar(&cmd.Driver, "driver", "", "The driver to use for managing the virtual cluster, can be either helm or platform.")
+	cobraCmd.Flags().StringVar(&cmd.Output, "output", "table", "Choose the format of the output. [table|json]")
 
 	return cobraCmd
 }
 
 // Run executes the functionality
-func (cmd *ListCmd) Run(cobraCmd *cobra.Command, args []string) error {
-	// first load the kube config
-	kubeClientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{
-		CurrentContext: cmd.Context,
-	})
-	namespace := metav1.NamespaceAll
-	if cmd.Namespace != "" {
-		namespace = cmd.Namespace
-	}
+func (cmd *ListCmd) Run(cobraCmd *cobra.Command) error {
+	cfg := cmd.LoadedConfig(cmd.log)
 
-	// get all statefulsets with the label app=vcluster
-	restConfig, err := kubeClientConfig.ClientConfig()
+	// If driver has been passed as flag use it, otherwise read it from the config file
+	driverType, err := config.ParseDriverType(cmp.Or(cmd.Driver, string(cfg.Driver.Type)))
 	if err != nil {
-		return err
+		return fmt.Errorf("parse driver type: %w", err)
 	}
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return err
-	}
-
-	pods, err := client.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: "app=vcluster",
-	})
-	if err != nil {
-		if kerrors.IsForbidden(err) {
-			// try the current namespace instead
-			namespace, _, err = kubeClientConfig.Namespace()
-			if err != nil {
-				return err
-			} else if namespace == "" {
-				namespace = "default"
-			}
-			pods, err = client.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
-				LabelSelector: "app=vcluster",
-			})
-			if err != nil {
-				return err
-			}
-		} else {
-			return err
-		}
+	if driverType == config.PlatformDriver {
+		return cli.ListPlatform(cobraCmd.Context(), &cmd.ListOptions, cmd.GlobalFlags, cmd.log, "")
 	}
 
-	vclusters := []VCluster{}
-	for _, p := range pods.Items {
-		if v, ok := p.Labels["release"]; ok {
-			vclusters = append(vclusters, VCluster{
-				Name:       v,
-				Namespace:  p.Namespace,
-				Created:    p.GetCreationTimestamp().Time,
-				AgeSeconds: int(time.Since(p.GetCreationTimestamp().Time).Seconds()),
-			})
-		}
-	}
-
-	if cmd.output == "json" {
-		bytes, err := json.MarshalIndent(&vclusters, "", "    ")
-		if err != nil {
-			return errors.Wrap(err, "json marshal vclusters")
-		}
-		cmd.log.WriteString(string(bytes) + "\n")
-	} else {
-		header := []string{"NAME", "NAMESPACE", "CREATED", "AGE"}
-		values := [][]string{}
-		for _, vcluster := range vclusters {
-			values = append(values, []string{
-				vcluster.Name,
-				vcluster.Namespace,
-				vcluster.Created.String(),
-				time.Since(vcluster.Created).Round(1 * time.Second).String(),
-			})
-		}
-
-		log.PrintTable(cmd.log, header, values)
-	}
-
-	return nil
+	return cli.ListHelm(cobraCmd.Context(), &cmd.ListOptions, cmd.GlobalFlags, cmd.log)
 }

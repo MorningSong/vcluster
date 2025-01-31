@@ -1,26 +1,56 @@
 name: Lint
 
 on:
-  release:
-    types: [created]
   pull_request:
     branches:
       - main
-      - v0.5
+      - v*
     paths:
       - "**.go"
+      - ".github/workflows/lint.yaml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   golangci:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@v2
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
         with:
-          version: v1.29
-          args:
-            -v
-            --config=.golangci.yml
-            --max-same-issues=50
+          go-version-file: ./go.mod
+          cache: false
+
+      - name: Generate Embedded Helm Chart
+        run: |
+          go generate ./...
+
+      - name: Verify schema changes
+        run: |
+          VALUES_SHA=$(cat chart/values.yaml | sha256sum)
+          VALUES_SCHEMA_SHA=$(cat chart/values.schema.json | sha256sum)
+
+          go run hack/schema/main.go
+
+          VALUES_SHA_AFTER=$(cat chart/values.yaml | sha256sum)
+          VALUES_SCHEMA_SHA_AFTER=$(cat chart/values.schema.json | sha256sum)
+
+          # if there are changes, tell developer to run script
+          if [ "$VALUES_SHA" != "$VALUES_SHA_AFTER" ] || [ "$VALUES_SCHEMA_SHA" != "$VALUES_SCHEMA_SHA_AFTER" ]; then
+            echo "Seems like you forgot to run 'go run hack/schema/main.go' before committing your changes!"
+            exit 1
+          fi
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
+
+      - name: Build custom golangci-lint
+        run: golangci-lint custom
+
+      - name: Run golangci-lint
+        run: ./custom-gcl run

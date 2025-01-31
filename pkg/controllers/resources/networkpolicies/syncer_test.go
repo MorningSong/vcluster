@@ -1,13 +1,15 @@
 package networkpolicies
 
 import (
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
-	"gotest.tools/assert"
 	"testing"
 
-	podstranslate "github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
-	generictesting "github.com/loft-sh/vcluster/pkg/controllers/syncer/testing"
+	"github.com/loft-sh/vcluster/pkg/config"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
+	testingutil "github.com/loft-sh/vcluster/pkg/util/testing"
+	"gotest.tools/assert"
+	"k8s.io/utils/ptr"
+
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 
 	networkingv1 "k8s.io/api/networking/v1"
@@ -15,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/pointer"
 )
 
 func TestSync(t *testing.T) {
@@ -25,7 +26,7 @@ func TestSync(t *testing.T) {
 		},
 		{
 			Port:    &intstr.IntOrString{Type: intstr.Int, IntVal: 1024},
-			EndPort: pointer.Int32(2 ^ 32),
+			EndPort: ptr.To(int32(2 ^ 32)),
 		},
 		{
 			Port: &intstr.IntOrString{Type: intstr.String, StrVal: "namedport"},
@@ -50,13 +51,13 @@ func TestSync(t *testing.T) {
 	pBaseSpec := networkingv1.NetworkPolicySpec{
 		PodSelector: metav1.LabelSelector{
 			MatchLabels: map[string]string{
-				translator.ConvertLabelKey("mykey"): "mylabel",
-				translate.NamespaceLabel:            vObjectMeta.Namespace,
-				translate.MarkerLabel:               translate.Suffix,
+				translate.HostLabel("mykey"): "mylabel",
+				translate.NamespaceLabel:     vObjectMeta.Namespace,
+				translate.MarkerLabel:        translate.VClusterName,
 			},
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				{
-					Key:      translator.ConvertLabelKey("secondkey"),
+					Key:      translate.HostLabel("secondkey"),
 					Operator: metav1.LabelSelectorOpIn,
 					Values:   []string{"label-A", "label-B"},
 				},
@@ -64,14 +65,18 @@ func TestSync(t *testing.T) {
 		},
 	}
 	pObjectMeta := metav1.ObjectMeta{
-		Name:      translate.PhysicalName("testnetworkpolicy", "test"),
+		Name:      translate.Default.HostName(nil, "testnetworkpolicy", "test").Name,
 		Namespace: "test",
 		Annotations: map[string]string{
-			translator.NameAnnotation:      vObjectMeta.Name,
-			translator.NamespaceAnnotation: vObjectMeta.Namespace,
+			translate.NameAnnotation:          vObjectMeta.Name,
+			translate.NamespaceAnnotation:     vObjectMeta.Namespace,
+			translate.UIDAnnotation:           "",
+			translate.KindAnnotation:          networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy").String(),
+			translate.HostNameAnnotation:      translate.Default.HostName(nil, "testnetworkpolicy", "test").Name,
+			translate.HostNamespaceAnnotation: "test",
 		},
 		Labels: map[string]string{
-			translate.MarkerLabel:    translate.Suffix,
+			translate.MarkerLabel:    translate.VClusterName,
 			translate.NamespaceLabel: vObjectMeta.Namespace,
 		},
 	}
@@ -91,7 +96,7 @@ func TestSync(t *testing.T) {
 	pnetworkPolicyNoPodSelector.Spec.PodSelector = metav1.LabelSelector{
 		MatchLabels: map[string]string{
 			translate.NamespaceLabel: vObjectMeta.Namespace,
-			translate.MarkerLabel:    translate.Suffix,
+			translate.MarkerLabel:    translate.VClusterName,
 		},
 	}
 
@@ -123,9 +128,9 @@ func TestSync(t *testing.T) {
 			Ports: somePorts,
 			From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					translator.ConvertLabelKey("random-key"): "value",
-					translate.MarkerLabel:                    translate.Suffix,
-					translate.NamespaceLabel:                 vnetworkPolicyWithPodSelectorNoNs.GetNamespace(),
+					translate.HostLabel("random-key"): "value",
+					translate.MarkerLabel:             translate.VClusterName,
+					translate.NamespaceLabel:          vnetworkPolicyWithPodSelectorNoNs.GetNamespace(),
 				},
 				MatchExpressions: []metav1.LabelSelectorRequirement{},
 			}}},
@@ -145,7 +150,7 @@ func TestSync(t *testing.T) {
 
 	pnetworkPolicyWithLabelSelectorNsSelector := pnetworkPolicyWithLabelSelectorNoNs.DeepCopy()
 	delete(pnetworkPolicyWithLabelSelectorNsSelector.Spec.Ingress[0].From[0].PodSelector.MatchLabels, translate.NamespaceLabel)
-	pnetworkPolicyWithLabelSelectorNsSelector.Spec.Ingress[0].From[0].PodSelector.MatchLabels[translator.ConvertLabelKeyWithPrefix(podstranslate.NamespaceLabelPrefix, "nslabelkey")] = "abc"
+	pnetworkPolicyWithLabelSelectorNsSelector.Spec.Ingress[0].From[0].PodSelector.MatchLabels[translate.HostLabelNamespace("nslabelkey")] = "abc"
 
 	vnetworkPolicyEgressWithPodSelectorNoNs := vBaseNetworkPolicy.DeepCopy()
 	vnetworkPolicyEgressWithPodSelectorNoNs.Spec.Egress = []networkingv1.NetworkPolicyEgressRule{
@@ -195,16 +200,16 @@ func TestSync(t *testing.T) {
 			From: []networkingv1.NetworkPolicyPeer{{
 				PodSelector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{
-						translate.MarkerLabel: translate.Suffix,
+						translate.MarkerLabel: translate.VClusterName,
 					},
 					MatchExpressions: []metav1.LabelSelectorRequirement{
 						{
-							Key:      translator.ConvertLabelKey("pod-expr-key"),
+							Key:      translate.HostLabel("pod-expr-key"),
 							Operator: metav1.LabelSelectorOpExists,
 							Values:   []string{"some-pod-key"},
 						},
 						{
-							Key:      translator.ConvertLabelKeyWithPrefix(podstranslate.NamespaceLabelPrefix, "ns-expr-key"),
+							Key:      translate.HostLabelNamespace("ns-expr-key"),
 							Operator: metav1.LabelSelectorOpDoesNotExist,
 							Values:   []string{"forbidden-ns-key"},
 						},
@@ -214,7 +219,10 @@ func TestSync(t *testing.T) {
 		},
 	}
 
-	generictesting.RunTests(t, []*generictesting.SyncTest{
+	syncertesting.RunTestsWithContext(t, func(vConfig *config.VirtualClusterConfig, pClient *testingutil.FakeIndexClient, vClient *testingutil.FakeIndexClient) *synccontext.RegisterContext {
+		vConfig.Sync.ToHost.NetworkPolicies.Enabled = true
+		return syncertesting.NewFakeRegisterContext(vConfig, pClient, vClient)
+	}, []*syncertesting.SyncTest{
 		{
 			Name:                "Create forward",
 			InitialVirtualState: []runtime.Object{vBaseNetworkPolicy.DeepCopy()},
@@ -225,8 +233,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pBaseNetworkPolicy.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vBaseNetworkPolicy.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vBaseNetworkPolicy.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -240,17 +248,14 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyNoPodSelector.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyNoPodSelector.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyNoPodSelector.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
 		{
-			Name: "Update forward",
-			InitialVirtualState: []runtime.Object{&networkingv1.NetworkPolicy{
-				ObjectMeta: vObjectMeta,
-				Spec:       vBaseSpec,
-			}},
+			Name:                "Update forward",
+			InitialVirtualState: []runtime.Object{vBaseNetworkPolicy.DeepCopy()},
 			InitialPhysicalState: []runtime.Object{&networkingv1.NetworkPolicy{
 				ObjectMeta: pObjectMeta,
 				Spec:       networkingv1.NetworkPolicySpec{},
@@ -265,17 +270,23 @@ func TestSync(t *testing.T) {
 				}},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				pNetworkPolicy := &networkingv1.NetworkPolicy{
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				pNetworkPolicyOld := &networkingv1.NetworkPolicy{
 					ObjectMeta: pObjectMeta,
 					Spec:       networkingv1.NetworkPolicySpec{},
 				}
+				pNetworkPolicy := pNetworkPolicyOld.DeepCopy()
 				pNetworkPolicy.ResourceVersion = "999"
 
-				_, err := syncer.(*networkPolicySyncer).Sync(syncCtx, pNetworkPolicy, &networkingv1.NetworkPolicy{
-					ObjectMeta: vObjectMeta,
-					Spec:       vBaseSpec,
-				})
+				vNetworkPolicyOld := vBaseNetworkPolicy
+				vNetworkPolicy := vNetworkPolicyOld.DeepCopy()
+
+				_, err := syncer.(*networkPolicySyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					pNetworkPolicyOld,
+					pNetworkPolicy,
+					vNetworkPolicyOld,
+					vNetworkPolicy,
+				))
 				assert.NilError(t, err)
 			},
 		},
@@ -290,11 +301,21 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pBaseNetworkPolicy.DeepCopy()},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+
+				vNetworkPolicyOld := vBaseNetworkPolicy.DeepCopy()
 				vNetworkPolicy := vBaseNetworkPolicy.DeepCopy()
 				vNetworkPolicy.ResourceVersion = "999"
 
-				_, err := syncer.(*networkPolicySyncer).Sync(syncCtx, pBaseNetworkPolicy.DeepCopy(), vNetworkPolicy)
+				pNetworkPolicyOld := pBaseNetworkPolicy.DeepCopy()
+				pNetworkPolicy := pBaseNetworkPolicy.DeepCopy()
+
+				_, err := syncer.(*networkPolicySyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(
+					pNetworkPolicyOld,
+					pNetworkPolicy,
+					vNetworkPolicyOld,
+					vNetworkPolicy,
+				))
 				assert.NilError(t, err)
 			},
 		},
@@ -308,8 +329,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyWithIPBlock},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyWithIPBlock.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyWithIPBlock.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -323,8 +344,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyWithLabelSelectorNoNs},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyWithPodSelectorNoNs.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyWithPodSelectorNoNs.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -338,8 +359,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyWithLabelSelectorEmptyNs},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyWithPodSelectorEmptyNs.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyWithPodSelectorEmptyNs.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -353,8 +374,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyWithLabelSelectorNsSelector},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyWithPodSelectorNsSelector.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyWithPodSelectorNsSelector.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -368,8 +389,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyWithMatchExpressions},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyWithMatchExpressions.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyWithMatchExpressions.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},
@@ -383,8 +404,8 @@ func TestSync(t *testing.T) {
 				networkingv1.SchemeGroupVersion.WithKind("NetworkPolicy"): {pnetworkPolicyEgressWithLabelSelectorNoNs},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*networkPolicySyncer).SyncDown(syncCtx, vnetworkPolicyEgressWithPodSelectorNoNs.DeepCopy())
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*networkPolicySyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(vnetworkPolicyEgressWithPodSelectorNoNs.DeepCopy()))
 				assert.NilError(t, err)
 			},
 		},

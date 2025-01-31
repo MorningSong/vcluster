@@ -2,20 +2,19 @@ package delegatingauthenticator
 
 import (
 	"context"
-	"errors"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/loft-sh/vcluster/pkg/authentication/bearertoken"
 	"github.com/loft-sh/vcluster/pkg/util/clienthelper"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
-	"k8s.io/apiserver/pkg/authentication/request/bearertoken"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func New(client client.Client) authenticator.Request {
-	cache, _ := lru.New(256)
+	cache, _ := lru.New[string, cacheEntry](256)
 	return bearertoken.New(&delegatingAuthenticator{
 		client: client,
 		cache:  cache,
@@ -24,7 +23,7 @@ func New(client client.Client) authenticator.Request {
 
 type delegatingAuthenticator struct {
 	client client.Client
-	cache  *lru.Cache
+	cache  *lru.Cache[string, cacheEntry]
 }
 
 type cacheEntry struct {
@@ -37,8 +36,8 @@ func (d *delegatingAuthenticator) AuthenticateToken(ctx context.Context, token s
 
 	// check if in cache
 	entry, ok := d.cache.Get(token)
-	if ok && entry.(*cacheEntry).exp.After(now) {
-		return entry.(*cacheEntry).response, true, nil
+	if ok && entry.exp.After(now) {
+		return entry.response, true, nil
 	}
 
 	tokReview := &authenticationv1.TokenReview{
@@ -50,7 +49,7 @@ func (d *delegatingAuthenticator) AuthenticateToken(ctx context.Context, token s
 	if err != nil {
 		return nil, false, err
 	} else if !tokReview.Status.Authenticated {
-		return nil, false, errors.New(tokReview.Status.Error)
+		return nil, false, nil
 	}
 
 	response := &authenticator.Response{
@@ -62,7 +61,7 @@ func (d *delegatingAuthenticator) AuthenticateToken(ctx context.Context, token s
 			Extra:  clienthelper.ConvertExtraFrom(tokReview.Status.User.Extra),
 		},
 	}
-	d.cache.Add(token, &cacheEntry{
+	d.cache.Add(token, cacheEntry{
 		response: response,
 		exp:      now.Add(time.Second * 5),
 	})

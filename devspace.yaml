@@ -1,182 +1,240 @@
-version: v1beta11
+version: v2beta1
+name: vcluster
+
+# Variables used
 vars:
-  - name: SYNCER_IMAGE
-    value: ghcr.io/loft-sh/loft-enterprise/dev-vcluster
-  - name: K3S_IMAGE
-    value: rancher/k3s:v1.23.3-k3s1
-  # Replace this with your clusters service CIDR, you can find it out via
-  # kubectl apply -f hack/wrong-cluster-ip-service.yaml
-  - name: SERVICE_CIDR
-    value: 10.96.0.0/12
+  # Make sure vcluster is the default namespace
+  DEVSPACE_FLAGS: "-n vcluster"
+  SYNCER_IMAGE: ghcr.io/loft-sh/loft-enterprise/dev-vcluster
+  COMMON_VALUES: ./test/commonValues.yaml
+  CONFORMANCE_VALUES: ./test/conformanceValues.yaml
+  PRO_VALUES: ./test/proValues.yaml
+  VALUES_FILE: ./test/e2e/values.yaml
+
+# Images DevSpace will build for vcluster
 images:
   vcluster:
+    dockerfile: ./Dockerfile
     image: ${SYNCER_IMAGE}
     rebuildStrategy: ignoreContextChanges
-    build:
-      buildKit:
-        options:
-          target: builder
+    target: builder
+    buildKit: {}
+
+# Deployment used for vcluster
 deployments:
-  - name: vcluster
+  vcluster-k8s:
     helm:
+      releaseName: vcluster
       chart:
-        name: ./charts/k3s
+        name: ./chart
       values:
-        serviceCIDR: ${SERVICE_CIDR}
-        etcd:
-          replicas: 3
-        api:
-          replicas: 3
-        controller:
-          replicas: 3
-        enableHA: true
-        tolerations:
-          - operator: "Exists"
-        serviceAccount:
-          create: false
-          name: default
-        vcluster:
-          image: ${K3S_IMAGE}
-        rbac:
-          clusterRole:
-            create: true
-          role:
-            extended: true
-        syncer:
-          readinessProbe:
-            enabled: false
-          livenessProbe:
-            enabled: false
-          image: ${SYNCER_IMAGE}
-          noArgs: true
-          workingDir: /vcluster-dev
-          command: ["sleep"]
-          extraArgs: ["99999999999"]
+        controlPlane:
+          distro:
+            k8s:
+              enabled: true
+          statefulSet:
+            image:
+              registry: ""
+              repository: image(${SYNCER_IMAGE})
+              tag: tag(${SYNCER_IMAGE})
+            scheduling:
+              tolerations:
+                - operator: "Exists"
+          service:
+            spec:
+              type: NodePort
+          advanced:
+            serviceAccount:
+              enabled: false
+              name: default
+        telemetry:
+          enabled: false
+
+  vcluster-k3s:
+    helm:
+      releaseName: vcluster
+      chart:
+        name: ./chart
+      values:
+        controlPlane:
+          distro:
+            k3s:
+              enabled: true
+          statefulSet:
+            image:
+              registry: ""
+              repository: image(${SYNCER_IMAGE})
+              tag: tag(${SYNCER_IMAGE})
+            scheduling:
+              tolerations:
+                - operator: "Exists"
+          service:
+            spec:
+              type: NodePort
+          advanced:
+            serviceAccount:
+              enabled: false
+              name: default
+        telemetry:
+          enabled: false
+
+  vcluster-k0s:
+    helm:
+      releaseName: vcluster
+      chart:
+        name: ./chart
+      values:
+        controlPlane:
+          distro:
+            k0s:
+              enabled: true
+          statefulSet:
+            image:
+              registry: ""
+              repository: image(${SYNCER_IMAGE})
+              tag: tag(${SYNCER_IMAGE})
+            scheduling:
+              tolerations:
+                - operator: "Exists"
+          service:
+            spec:
+              type: NodePort
+          advanced:
+            serviceAccount:
+              enabled: false
+              name: default
+        telemetry:
+          enabled: false
+
+# Dev Configuration for vcluster
 dev:
-  terminal:
+  vcluster:
     imageSelector: ${SYNCER_IMAGE}
-    command: ["./devspace_start.sh"]
-  ports:
-    - imageSelector: ${SYNCER_IMAGE}
-      forward:
-        - port: 2346
-          remotePort: 2345
-  sync:
-    - imageSelector: ${SYNCER_IMAGE}
-      excludePaths:
-        - '**'
-        - '!/pkg'
-        - '!/cmd'
-        - '!/vendor'
-        - '!/hack'
-        - '!/go.mod'
-        - '!/go.sum'
-        - '!/devspace_start.sh'
-        - '!/manifests'
-        - '/manifests/coredns'
-commands:
-  - name: dev
-    command: "devspace dev -n vcluster $@"
-  - name: dev-crc
-    command: "devspace dev -n vcluster --profile dev-crc $@"
-  - name: deploy
-    command: "devspace deploy --profile deploy -n vcluster -d $@"
-  - name: deploy-crc
-    command: "devspace deploy --profile deploy-crc -n vcluster -d $@"
+    container: syncer
+    workingDir: /vcluster-dev
+    resources:
+      limits:
+        cpu: "0" # to prevent CPU throttling during compilation
+        memory: "0" # to prevent OOM kills which can happen during first compilation due to high number of deps
+    terminal:
+      command: "./devspace_start.sh"
+    ports:
+      - port: 2346:2345
+    sync:
+      - excludePaths:
+          - "**"
+          - "!/pkg"
+          - "cmd/vclusterctl/cmd/charts"
+          - "!/cmd"
+          - "!/vendor"
+          - "!/config"
+          - "!/hack"
+          - "!/go.mod"
+          - "!/go.sum"
+          - "!/devspace_start.sh"
+          - "!/manifests"
+          - "/manifests/coredns" # shouldn't sync to this path because it is mounted from a ConfigMap as ReadOnly
+
+# Pipelines used for vcluster
+pipelines:
+  dev:
+    flags:
+      - name: distro
+        description: "Virtual cluster distribution to use"
+        default: "k8s"
+        type: string
+    run: |-
+      # Deploy the vcluster
+      run_pipelines deploy --set-flag distro=$(get_flag distro)
+
+      # Start dev mode
+      start_dev --all
+
+  deploy:
+    flags:
+      - name: distro
+        description: "Virtual cluster distribution to use"
+        default: "k8s"
+        type: string
+    run: |-
+      # Make sure pull secrets are there
+      ensure_pull_secrets --all
+
+      # Build the vcluster image
+      build_images --all
+
+      if $(is_in "test-conformance" "${DEVSPACE_PROFILES}"); then
+        minikube image load $(get_image "vcluster") --overwrite=false || true
+      fi
+
+      # Deploy the vcluster
+      if is_equal $(get_flag distro) k8s; then
+        create_deployments vcluster-k8s
+      elif is_equal $(get_flag distro) k0s; then
+        create_deployments vcluster-k0s
+      else
+        create_deployments vcluster-k3s
+      fi
+
+  purge:
+    run: |-
+      # Purge the vcluster
+      run_default_pipeline purge
+
+      # Make sure the pvcs are deleted as well
+      kubectl delete pvc --all -n ${DEVSPACE_NAMESPACE}
+
 profiles:
-  - name: parent-deploy
-    patches:
-      - op: remove
-        path: deployments.name=vcluster.helm.values.syncer.command
-      - op: replace
-        path: deployments.name=vcluster.helm.values.syncer
-        value:
-          image: ${SYNCER_IMAGE}
-  - name: deploy
-    parents: 
-      - profile: parent-deploy
-    patches:
-      - op: remove
-        path: images.vcluster.rebuildStrategy
-      - op: replace
-        path: images.vcluster.build.buildKit
-        value: {}
-  - name: k3s
-    # This profile is empty for now because the default config is for k3s
-    # Keep the empty profile because it's used in the distribution matrix of the GH workflow for e2e. 
-  - name: k0s
-    patches:
-      - op: replace
-        path: deployments.name=vcluster.helm.chart.name
-        value: ./charts/k0s
-      - op: remove
-        path: deployments.name=vcluster.helm.values.vcluster.image
-  - name: k8s
-    patches:
-      - op: replace
-        path: deployments.name=vcluster.helm.chart.name
-        value: ./charts/k8s
-  - name: kind-load
+  - name: test-k3s
     patches:
       - op: add
-        path: hooks
+        path: deployments.vcluster-k3s.helm
         value:
-          - name: "post-image-build-hook"
-            command: |
-              kind load docker-image image(vcluster):tag(vcluster)
-            events: ["after:build:vcluster"]
-  - name: no-cpu-requests
+          valuesFiles:
+            - ${COMMON_VALUES}
+            - ${VALUES_FILE}
+
+  - name: test-k8s
     patches:
-      - op: replace
-        path: deployments.name=vcluster.helm.values.syncer.resources
-        value: 
-          requests:
-            cpu: "0"
-      - op: replace
-        path: deployments.name=vcluster.helm.values.vcluster.resources
-        value: 
-          requests:
-            cpu: "0"
-      - op: replace
-        path: deployments.name=vcluster.helm.values.etcd.resources
-        value: 
-          requests:
-            cpu: "0"
-      - op: replace
-        path: deployments.name=vcluster.helm.values.controller.resources
-        value: 
-          requests:
-            cpu: "0"
-      - op: replace
-        path: deployments.name=vcluster.helm.values.api.resources
-        value: 
-          requests:
-            cpu: "0"
-  - name: sync-networkpolicies
-    patches:
-      - op: replace
-        path: deployments.name=vcluster.helm.values.syncer.extraArgs
-        value: ['--sync=networkpolicies']
-  - name: parent-crc
-    patches:
-      - op: replace
-        path: images.vcluster.build.custom
+      - op: add
+        path: deployments.vcluster-k8s.helm
         value:
-          command: ./hack/crc-podman-build.sh
-          imageFlag: "-t"
-      - op: replace
-        path: deployments.name=vcluster.helm.values.openshift
-        value: 
-          enable: true
-  - name: deploy-crc
-    parents: 
-      - profile: parent-deploy
-      - profile: parent-crc
-  - name: dev-crc
-    parents: 
-      - profile: parent-crc
+          valuesFiles:
+            - ${COMMON_VALUES}
+            - ${VALUES_FILE}
+
+  - name: test-k0s
+    patches:
+      - op: add
+        path: deployments.vcluster-k0s.helm
+        value:
+          valuesFiles:
+            - ${COMMON_VALUES}
+            - ${VALUES_FILE}
+  - name: test-pro
+    patches:
+      - op: add
+        path: deployments.vcluster-k8s.helm
+        value:
+          valuesFiles:
+            - ${COMMON_VALUES}
+            - ${VALUES_FILE}
+            - ${PRO_VALUES}
+  - name: test-conformance
     patches:
       - op: replace
-        path: images.vcluster.build.custom.args
-        value: 
-         - "--target=builder"
+        path: images.vcluster.buildKit
+        value:
+          preferMinikube: false
+      - op: add
+        path: deployments.vcluster-k8s.helm
+        value:
+          valuesFiles:
+            - ${CONFORMANCE_VALUES}
+
+commands:
+  # e.g. devspace run test k3s
+  # e.g. devspace run test k3s --var VALUES_FILE=./test/e2e_node
+  test: |-
+    devspace purge -n ${DEVSPACE_NAMESPACE} --debug
+    devspace dev -n ${DEVSPACE_NAMESPACE} --profile test-$@

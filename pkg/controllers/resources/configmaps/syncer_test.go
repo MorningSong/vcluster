@@ -1,16 +1,16 @@
 package configmaps
 
 import (
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
-	generictesting "github.com/loft-sh/vcluster/pkg/controllers/syncer/testing"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"testing"
+
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	syncertesting "github.com/loft-sh/vcluster/pkg/syncer/testing"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"gotest.tools/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"testing"
 )
 
 func TestSync(t *testing.T) {
@@ -28,11 +28,15 @@ func TestSync(t *testing.T) {
 	}
 	syncedConfigMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      translate.PhysicalName(baseConfigMap.Name, baseConfigMap.Namespace),
+			Name:      translate.Default.HostName(nil, baseConfigMap.Name, baseConfigMap.Namespace).Name,
 			Namespace: "test",
 			Annotations: map[string]string{
-				translator.NameAnnotation:      baseConfigMap.Name,
-				translator.NamespaceAnnotation: baseConfigMap.Namespace,
+				translate.NameAnnotation:          baseConfigMap.Name,
+				translate.NamespaceAnnotation:     baseConfigMap.Namespace,
+				translate.UIDAnnotation:           "",
+				translate.KindAnnotation:          corev1.SchemeGroupVersion.WithKind("ConfigMap").String(),
+				translate.HostNamespaceAnnotation: "test",
+				translate.HostNameAnnotation:      translate.Default.HostName(nil, baseConfigMap.Name, baseConfigMap.Namespace).Name,
 			},
 			Labels: map[string]string{
 				translate.NamespaceLabel: baseConfigMap.Namespace,
@@ -64,7 +68,7 @@ func TestSync(t *testing.T) {
 		},
 	}
 
-	generictesting.RunTests(t, []*generictesting.SyncTest{
+	syncertesting.RunTests(t, []*syncertesting.SyncTest{
 		{
 			Name: "Unused config map",
 			InitialVirtualState: []runtime.Object{
@@ -74,8 +78,8 @@ func TestSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("ConfigMap"): {},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*configMapSyncer).SyncDown(syncCtx, baseConfigMap)
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*configMapSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(baseConfigMap))
 				assert.NilError(t, err)
 			},
 		},
@@ -91,8 +95,8 @@ func TestSync(t *testing.T) {
 				},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*configMapSyncer).SyncDown(syncCtx, baseConfigMap)
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*configMapSyncer).SyncToHost(syncCtx, synccontext.NewSyncToHostEvent(baseConfigMap))
 				assert.NilError(t, err)
 			},
 		},
@@ -111,8 +115,8 @@ func TestSync(t *testing.T) {
 				},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*configMapSyncer).Sync(syncCtx, syncedConfigMap, updatedConfigMap)
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*configMapSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(syncedConfigMap, syncedConfigMap, baseConfigMap, updatedConfigMap))
 				assert.NilError(t, err)
 			},
 		},
@@ -128,55 +132,10 @@ func TestSync(t *testing.T) {
 				corev1.SchemeGroupVersion.WithKind("ConfigMap"): {},
 			},
 			Sync: func(ctx *synccontext.RegisterContext) {
-				syncCtx, syncer := generictesting.FakeStartSyncer(t, ctx, New)
-				_, err := syncer.(*configMapSyncer).Sync(syncCtx, syncedConfigMap, updatedConfigMap)
+				syncCtx, syncer := syncertesting.FakeStartSyncer(t, ctx, New)
+				_, err := syncer.(*configMapSyncer).Sync(syncCtx, synccontext.NewSyncEventWithOld(syncedConfigMap, syncedConfigMap, updatedConfigMap, updatedConfigMap))
 				assert.NilError(t, err)
 			},
 		},
 	})
-}
-
-func TestMapping(t *testing.T) {
-	// test pod
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test",
-			Namespace: "test",
-		},
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name: "test",
-					Env: []corev1.EnvVar{
-						{
-							Name: "test",
-							ValueFrom: &corev1.EnvVarSource{
-								ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: "a",
-									},
-								},
-							},
-						},
-					},
-				},
-			},
-			Volumes: []corev1.Volume{
-				{
-					Name: "test",
-					VolumeSource: corev1.VolumeSource{
-						ConfigMap: &corev1.ConfigMapVolumeSource{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: "b",
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	requests := mapPods(pod)
-	if len(requests) != 2 || requests[0].Name != "a" || requests[0].Namespace != "test" || requests[1].Name != "b" || requests[1].Namespace != "test" {
-		t.Fatalf("Wrong pod requests returned: %#+v", requests)
-	}
 }

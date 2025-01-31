@@ -1,124 +1,163 @@
 package configmaps
 
 import (
-	"context"
 	"fmt"
-	"strings"
-
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
 
 	"github.com/loft-sh/vcluster/pkg/constants"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/pods"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/patcher"
+	"github.com/loft-sh/vcluster/pkg/pro"
+	"github.com/loft-sh/vcluster/pkg/syncer"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/syncer/translator"
+	syncertypes "github.com/loft-sh/vcluster/pkg/syncer/types"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
-func New(ctx *synccontext.RegisterContext) (syncer.Object, error) {
+func New(ctx *synccontext.RegisterContext) (syncertypes.Object, error) {
+	mapper, err := ctx.Mappings.ByGVK(mappings.ConfigMaps())
+	if err != nil {
+		return nil, err
+	}
+
+	// only add importer if all configmaps should get synced
+	importer := syncer.NewNoopImporter()
+	if ctx.Config.Sync.ToHost.ConfigMaps.All {
+		importer = pro.NewImporter(mapper)
+	}
+
 	return &configMapSyncer{
-		NamespacedTranslator: translator.NewNamespacedTranslator(ctx, "configmap", &corev1.ConfigMap{}),
+		GenericTranslator: translator.NewGenericTranslator(ctx, "configmap", &corev1.ConfigMap{}, mapper),
+		Importer:          importer,
 	}, nil
 }
 
 type configMapSyncer struct {
-	translator.NamespacedTranslator
+	syncertypes.GenericTranslator
+	syncertypes.Importer
 }
 
-var _ syncer.IndicesRegisterer = &configMapSyncer{}
+var _ syncertypes.OptionsProvider = &configMapSyncer{}
 
-func (s *configMapSyncer) RegisterIndices(ctx *synccontext.RegisterContext) error {
-	err := s.NamespacedTranslator.RegisterIndices(ctx)
-	if err != nil {
-		return err
+func (s *configMapSyncer) Options() *syncertypes.Options {
+	return &syncertypes.Options{
+		ObjectCaching: true,
 	}
-
-	// index pods by their used config maps
-	return ctx.VirtualManager.GetFieldIndexer().IndexField(ctx.Context, &corev1.Pod{}, constants.IndexByConfigMap, func(rawObj client.Object) []string {
-		pod := rawObj.(*corev1.Pod)
-		return pods.ConfigNamesFromPod(pod)
-	})
 }
 
-var _ syncer.ControllerModifier = &configMapSyncer{}
+var _ syncertypes.Syncer = &configMapSyncer{}
+
+func (s *configMapSyncer) Syncer() syncertypes.Sync[client.Object] {
+	return syncer.ToGenericSyncer(s)
+}
+
+var _ syncertypes.ControllerModifier = &configMapSyncer{}
 
 func (s *configMapSyncer) ModifyController(ctx *synccontext.RegisterContext, builder *builder.Builder) (*builder.Builder, error) {
-	return builder.Watches(&source.Kind{Type: &corev1.Pod{}}, handler.EnqueueRequestsFromMapFunc(mapPods)), nil
+	return builder.WatchesRawSource(ctx.Mappings.Store().Watch(s.GroupVersionKind(), func(nameMapping synccontext.NameMapping, queue workqueue.TypedRateLimitingInterface[ctrl.Request]) {
+		queue.Add(reconcile.Request{NamespacedName: nameMapping.VirtualName})
+	})), nil
 }
 
-func (s *configMapSyncer) SyncDown(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
-	createNeeded, err := s.isConfigMapUsed(ctx, vObj)
-	if err != nil {
-		return ctrl.Result{}, err
-	} else if !createNeeded {
+func (s *configMapSyncer) SyncToHost(ctx *synccontext.SyncContext, event *synccontext.SyncToHostEvent[*corev1.ConfigMap]) (ctrl.Result, error) {
+	createNeeded := s.isConfigMapUsed(ctx, event.Virtual)
+	if !createNeeded {
 		return ctrl.Result{}, nil
 	}
 
-	return s.SyncDownCreate(ctx, vObj, s.translate(vObj.(*corev1.ConfigMap)))
-}
+	if event.HostOld != nil || event.Virtual.DeletionTimestamp != nil {
+		return patcher.DeleteVirtualObject(ctx, event.Virtual, event.HostOld, "host object was deleted")
+	}
 
-func (s *configMapSyncer) Sync(ctx *synccontext.SyncContext, pObj client.Object, vObj client.Object) (ctrl.Result, error) {
-	used, err := s.isConfigMapUsed(ctx, vObj)
+	pObj := translate.HostMetadata(event.Virtual, s.VirtualToHost(ctx, types.NamespacedName{Name: event.Virtual.Name, Namespace: event.Virtual.Namespace}, event.Virtual))
+	err := pro.ApplyPatchesHostObject(ctx, nil, pObj, event.Virtual, ctx.Config.Sync.ToHost.ConfigMaps.Patches, false)
 	if err != nil {
 		return ctrl.Result{}, err
-	} else if !used {
-		pConfigMap, _ := meta.Accessor(pObj)
-		ctx.Log.Infof("delete physical config map %s/%s, because it is not used anymore", pConfigMap.GetNamespace(), pConfigMap.GetName())
-		err = ctx.PhysicalClient.Delete(ctx.Context, pObj)
-		if err != nil {
-			ctx.Log.Infof("error deleting physical object %s/%s in physical cluster: %v", pConfigMap.GetNamespace(), pConfigMap.GetName(), err)
-			return ctrl.Result{}, err
-		}
+	}
 
+	return patcher.CreateHostObject(ctx, event.Virtual, pObj, s.EventRecorder(), false)
+}
+
+func (s *configMapSyncer) SyncToVirtual(ctx *synccontext.SyncContext, event *synccontext.SyncToVirtualEvent[*corev1.ConfigMap]) (_ ctrl.Result, retErr error) {
+	if event.VirtualOld != nil || event.Host.DeletionTimestamp != nil {
+		return patcher.DeleteHostObject(ctx, event.Host, event.VirtualOld, "virtual object was deleted")
+	}
+
+	vObj := translate.VirtualMetadata(event.Host, s.HostToVirtual(ctx, types.NamespacedName{Name: event.Host.Name, Namespace: event.Host.Namespace}, event.Host))
+	createNeeded := s.isConfigMapUsed(ctx, vObj)
+	if !createNeeded {
 		return ctrl.Result{}, nil
 	}
 
-	// did the configmap change?
-	return s.SyncDownUpdate(ctx, vObj, s.translateUpdate(pObj.(*corev1.ConfigMap), vObj.(*corev1.ConfigMap)))
-}
-
-func (s *configMapSyncer) isConfigMapUsed(ctx *synccontext.SyncContext, vObj runtime.Object) (bool, error) {
-	configMap, ok := vObj.(*corev1.ConfigMap)
-	if !ok || configMap == nil {
-		return false, fmt.Errorf("%#v is not a config map", vObj)
-	}
-
-	podList := &corev1.PodList{}
-	err := ctx.VirtualClient.List(context.TODO(), podList, client.MatchingFields{constants.IndexByConfigMap: configMap.Namespace + "/" + configMap.Name})
+	err := pro.ApplyPatchesVirtualObject(ctx, nil, vObj, event.Host, ctx.Config.Sync.ToHost.ConfigMaps.Patches, false)
 	if err != nil {
-		return false, err
+		return ctrl.Result{}, err
 	}
 
-	return len(podList.Items) > 0, nil
+	return patcher.CreateVirtualObject(ctx, event.Host, vObj, s.EventRecorder(), false)
 }
 
-func mapPods(obj client.Object) []reconcile.Request {
-	pod, ok := obj.(*corev1.Pod)
-	if !ok {
-		return nil
+func (s *configMapSyncer) Sync(ctx *synccontext.SyncContext, event *synccontext.SyncEvent[*corev1.ConfigMap]) (_ ctrl.Result, retErr error) {
+	used := s.isConfigMapUsed(ctx, event.Virtual)
+	if !used {
+		// virtual object is not here anymore, so we delete
+		return patcher.DeleteHostObject(ctx, event.Host, event.Virtual, "configmap is not used anymore")
 	}
 
-	requests := []reconcile.Request{}
-	names := pods.ConfigNamesFromPod(pod)
-	for _, name := range names {
-		splitted := strings.Split(name, "/")
-		if len(splitted) == 2 {
-			requests = append(requests, reconcile.Request{
-				NamespacedName: types.NamespacedName{
-					Namespace: splitted[0],
-					Name:      splitted[1],
-				},
-			})
+	patchHelper, err := patcher.NewSyncerPatcher(ctx, event.Host, event.Virtual, patcher.TranslatePatches(ctx.Config.Sync.ToHost.ConfigMaps.Patches, false))
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("new syncer patcher: %w", err)
+	}
+
+	defer func() {
+		if err := patchHelper.Patch(ctx, event.Host, event.Virtual); err != nil {
+			retErr = utilerrors.NewAggregate([]error{retErr, err})
 		}
+		if retErr != nil {
+			s.EventRecorder().Eventf(event.Virtual, "Warning", "SyncError", "Error syncing: %v", retErr)
+		}
+	}()
+
+	// bi-directional sync of annotations and labels
+	event.Virtual.Annotations, event.Host.Annotations = translate.AnnotationsBidirectionalUpdate(event)
+	event.Virtual.Labels, event.Host.Labels = translate.LabelsBidirectionalUpdate(event)
+
+	// bidirectional sync
+	event.Virtual.Data, event.Host.Data, err = patcher.MergeBidirectional(event.VirtualOld.Data, event.Virtual.Data, event.HostOld.Data, event.Host.Data)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	event.Virtual.BinaryData, event.Host.BinaryData, err = patcher.MergeBidirectional(event.VirtualOld.BinaryData, event.Virtual.BinaryData, event.HostOld.BinaryData, event.Host.BinaryData)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 
-	return requests
+	return ctrl.Result{}, nil
+}
+
+func (s *configMapSyncer) isConfigMapUsed(ctx *synccontext.SyncContext, vObj *corev1.ConfigMap) bool {
+	if vObj.Annotations[constants.SyncResourceAnnotation] == "true" {
+		return true
+	} else if ctx.Config.Sync.ToHost.ConfigMaps.All {
+		return true
+	}
+
+	// retrieve references for config map
+	references := ctx.Mappings.Store().ReferencesTo(ctx, synccontext.Object{
+		GroupVersionKind: s.GroupVersionKind(),
+		NamespacedName: types.NamespacedName{
+			Namespace: vObj.Namespace,
+			Name:      vObj.Name,
+		},
+	})
+
+	return len(references) > 0
 }

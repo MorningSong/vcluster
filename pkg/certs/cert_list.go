@@ -16,6 +16,7 @@ package certs
 import (
 	"crypto"
 	"crypto/x509"
+
 	"github.com/pkg/errors"
 
 	certutil "k8s.io/client-go/util/cert"
@@ -65,7 +66,6 @@ func (k *KubeadmCert) CreateFromCA(ic *InitConfiguration, caCert *x509.Certifica
 		key,
 		cfg,
 	)
-
 	if err != nil {
 		return errors.Wrapf(err, "failed to write or validate certificate %q", k.Name)
 	}
@@ -406,7 +406,10 @@ func makeAltNamesMutator(f func(*InitConfiguration) (*certutil.AltNames, error))
 		if err != nil {
 			return err
 		}
-		cc.AltNames = *altNames
+		if altNames != nil {
+			cc.AltNames = *altNames
+		}
+
 		return nil
 	}
 }

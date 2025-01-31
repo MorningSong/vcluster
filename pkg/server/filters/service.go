@@ -1,13 +1,14 @@
 package filters
 
 import (
-	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/services"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/scheme"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/clienthelper"
 	"github.com/loft-sh/vcluster/pkg/util/encoding"
 	"github.com/loft-sh/vcluster/pkg/util/random"
@@ -22,14 +23,13 @@ import (
 	"k8s.io/apiserver/pkg/endpoints/handlers/negotiation"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/client-go/rest"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func WithServiceCreateRedirect(handler http.Handler, uncachedLocalClient, uncachedVirtualClient client.Client, virtualConfig *rest.Config, targetNamespace string, syncedLabels []string, syncServiceSelector bool) http.Handler {
-	decoder := encoding.NewDecoder(uncachedLocalClient.Scheme(), false)
-	s := serializer.NewCodecFactory(uncachedVirtualClient.Scheme())
+func WithServiceCreateRedirect(handler http.Handler, registerCtx *synccontext.RegisterContext, uncachedLocalClient, uncachedVirtualClient client.Client) http.Handler {
+	decoder := encoding.NewDecoder(scheme.Scheme, false)
+	s := serializer.NewCodecFactory(scheme.Scheme)
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		info, ok := request.RequestInfoFrom(req.Context())
 		if !ok {
@@ -52,19 +52,23 @@ func WithServiceCreateRedirect(handler http.Handler, uncachedLocalClient, uncach
 				}
 
 				if len(options.DryRun) == 0 {
-					uncachedVirtualImpersonatingClient, err := clienthelper.NewImpersonatingClient(virtualConfig, uncachedVirtualClient.RESTMapper(), userInfo, uncachedVirtualClient.Scheme())
+					uncachedVirtualImpersonatingClient, err := clienthelper.NewImpersonatingClient(registerCtx.VirtualManager.GetConfig(), uncachedVirtualClient.RESTMapper(), userInfo, uncachedVirtualClient.Scheme())
 					if err != nil {
 						responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 						return
 					}
 
-					svc, err := createService(req, decoder, uncachedLocalClient, uncachedVirtualImpersonatingClient, info.Namespace, targetNamespace, syncedLabels, syncServiceSelector)
+					syncContext := registerCtx.ToSyncContext("create-service")
+					syncContext.VirtualClient = uncachedVirtualImpersonatingClient
+					syncContext.PhysicalClient = uncachedLocalClient
+
+					svc, err := createService(syncContext, req, decoder, info.Namespace)
 					if err != nil {
 						responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 						return
 					}
 
-					responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusCreated, svc)
+					responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusCreated, svc, false)
 					return
 				}
 			} else if info.Verb == "update" {
@@ -84,19 +88,23 @@ func WithServiceCreateRedirect(handler http.Handler, uncachedLocalClient, uncach
 					}
 
 					if vService.Spec.Type == corev1.ServiceTypeExternalName {
-						uncachedVirtualImpersonatingClient, err := clienthelper.NewImpersonatingClient(virtualConfig, uncachedVirtualClient.RESTMapper(), userInfo, uncachedVirtualClient.Scheme())
+						uncachedVirtualImpersonatingClient, err := clienthelper.NewImpersonatingClient(registerCtx.VirtualManager.GetConfig(), uncachedVirtualClient.RESTMapper(), userInfo, uncachedVirtualClient.Scheme())
 						if err != nil {
 							responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 							return
 						}
 
-						svc, err := updateService(req, decoder, uncachedLocalClient, uncachedVirtualImpersonatingClient, vService, targetNamespace)
+						syncContext := registerCtx.ToSyncContext("update-service")
+						syncContext.VirtualClient = uncachedVirtualImpersonatingClient
+						syncContext.PhysicalClient = uncachedLocalClient
+
+						svc, err := updateService(syncContext, req, decoder, vService)
 						if err != nil {
 							responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 							return
 						}
 
-						responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusOK, svc)
+						responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusOK, svc, false)
 						return
 					}
 				}
@@ -107,9 +115,9 @@ func WithServiceCreateRedirect(handler http.Handler, uncachedLocalClient, uncach
 	})
 }
 
-func updateService(req *http.Request, decoder encoding.Decoder, localClient client.Client, virtualClient client.Client, oldVService *corev1.Service, targetNamespace string) (runtime.Object, error) {
+func updateService(ctx *synccontext.SyncContext, req *http.Request, decoder encoding.Decoder, oldVService *corev1.Service) (runtime.Object, error) {
 	// authorization will be done at this point already, so we can redirect the request to the physical cluster
-	rawObj, err := ioutil.ReadAll(req.Body)
+	rawObj, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +135,7 @@ func updateService(req *http.Request, decoder encoding.Decoder, localClient clie
 
 	// type has not changed, we just update here
 	if newVService.ResourceVersion != oldVService.ResourceVersion || newVService.Spec.Type == oldVService.Spec.Type || newVService.Spec.ClusterIP != "" {
-		err = virtualClient.Update(req.Context(), newVService)
+		err = ctx.VirtualClient.Update(req.Context(), newVService)
 		if err != nil {
 			return nil, err
 		}
@@ -135,12 +143,10 @@ func updateService(req *http.Request, decoder encoding.Decoder, localClient clie
 		return newVService, nil
 	}
 
-	// we use a background context from now on as this is a critical operation
-	ctx := context.Background()
-
 	// okay now we have to change the physical service
 	pService := &corev1.Service{}
-	err = localClient.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: translate.PhysicalName(oldVService.Name, oldVService.Namespace)}, pService)
+	pServiceName := mappings.VirtualToHost(ctx, oldVService.Name, oldVService.Namespace, mappings.Services())
+	err = ctx.PhysicalClient.Get(ctx, client.ObjectKey{Namespace: pServiceName.Namespace, Name: pServiceName.Name}, pService)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			return nil, kerrors.NewNotFound(corev1.Resource("services"), oldVService.Name)
@@ -152,30 +158,35 @@ func updateService(req *http.Request, decoder encoding.Decoder, localClient clie
 	// we try to patch the service as this has the best chances to go through
 	originalPService := pService.DeepCopy()
 	pService.Spec.Type = newVService.Spec.Type
+	pService.Spec.Ports = newVService.Spec.Ports
 	pService.Spec.ClusterIP = ""
-	err = localClient.Patch(ctx, pService, client.MergeFrom(originalPService))
+	err = ctx.PhysicalClient.Patch(ctx, pService, client.MergeFrom(originalPService))
 	if err != nil {
 		return nil, err
 	}
 
 	// now we have the cluster ip that we can apply to the new service
 	newVService.Spec.ClusterIP = pService.Spec.ClusterIP
-	err = virtualClient.Update(ctx, newVService)
+	// also we need to apply newly allocated node ports
+	newVService.Spec.HealthCheckNodePort = pService.Spec.HealthCheckNodePort
+	newVService.Spec.Ports = pService.Spec.Ports
+
+	err = ctx.VirtualClient.Update(ctx, newVService)
 	if err != nil {
 		// this is actually worst case that can happen, as we have somehow now a really strange
 		// state in the cluster. This needs to be cleaned up by the controller via delete and create
 		// and we delete the physical service here. Maybe there is a better solution to this, but for
 		// now it works
-		_ = localClient.Delete(ctx, pService)
+		_ = ctx.PhysicalClient.Delete(ctx, pService)
 		return nil, err
 	}
 
 	return newVService, nil
 }
 
-func createService(req *http.Request, decoder encoding.Decoder, localClient client.Client, virtualClient client.Client, fromNamespace, targetNamespace string, syncedLabels []string, syncServiceSelector bool) (runtime.Object, error) {
+func createService(ctx *synccontext.SyncContext, req *http.Request, decoder encoding.Decoder, fromNamespace string) (runtime.Object, error) {
 	// authorization will be done at this point already, so we can redirect the request to the physical cluster
-	rawObj, err := ioutil.ReadAll(req.Body)
+	rawObj, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -196,21 +207,16 @@ func createService(req *http.Request, decoder encoding.Decoder, localClient clie
 
 	// generate a name, because this field is cleared
 	if vService.GenerateName != "" && vService.Name == "" {
-		vService.Name = vService.GenerateName + random.RandomString(5)
+		vService.Name = vService.GenerateName + random.String(5)
 	}
 
-	newService := translator.TranslateMetadata(targetNamespace, vService, syncedLabels).(*corev1.Service)
+	newService := translate.HostMetadata(vService, mappings.VirtualToHost(ctx, vService.Name, vService.Namespace, mappings.Services()))
 	if newService.Annotations == nil {
 		newService.Annotations = map[string]string{}
 	}
 	newService.Annotations[services.ServiceBlockDeletion] = "true"
-	if syncServiceSelector {
-		services.RewriteSelector(newService, vService)
-	} else {
-		newService.Spec.Selector = nil
-	}
-	services.StripNodePorts(newService)
-	err = localClient.Create(req.Context(), newService)
+	newService.Spec.Selector = translate.HostLabelsMap(vService.Spec.Selector, nil, vService.Namespace, false)
+	err = ctx.PhysicalClient.Create(req.Context(), newService)
 	if err != nil {
 		klog.Infof("Error creating service in physical cluster: %v", err)
 		if kerrors.IsAlreadyExists(err) {
@@ -227,11 +233,11 @@ func createService(req *http.Request, decoder encoding.Decoder, localClient clie
 	vService.Status = newService.Status
 
 	// now create the service in the virtual cluster
-	err = virtualClient.Create(req.Context(), vService)
+	err = ctx.VirtualClient.Create(req.Context(), vService)
 	if err != nil {
 		// try to cleanup the created physical service
 		klog.Infof("Error creating service in virtual cluster: %v", err)
-		_ = localClient.Delete(context.Background(), newService)
+		_ = ctx.PhysicalClient.Delete(ctx, newService)
 		return nil, err
 	}
 

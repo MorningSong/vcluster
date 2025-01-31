@@ -3,7 +3,7 @@ package filters
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"time"
 
@@ -24,7 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func WithNodeChanges(h http.Handler, uncachedLocalClient, uncachedVirtualClient client.Client, virtualConfig *rest.Config) http.Handler {
+func WithNodeChanges(ctx context.Context, h http.Handler, uncachedLocalClient, uncachedVirtualClient client.Client, virtualConfig *rest.Config) http.Handler {
 	decoder := encoding.NewDecoder(uncachedLocalClient.Scheme(), false)
 	s := serializer.NewCodecFactory(uncachedVirtualClient.Scheme())
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -44,19 +44,19 @@ func WithNodeChanges(h http.Handler, uncachedLocalClient, uncachedVirtualClient 
 
 				if len(options.DryRun) == 0 {
 					// authorization will be done at this point already, so we can redirect the request to the physical cluster
-					rawObj, err := ioutil.ReadAll(req.Body)
+					rawObj, err := io.ReadAll(req.Body)
 					if err != nil {
 						responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 						return
 					}
 
-					updatedNode, err := updateNode(decoder, uncachedLocalClient, uncachedVirtualClient, rawObj, info.Subresource == "status")
+					updatedNode, err := updateNode(ctx, decoder, uncachedLocalClient, uncachedVirtualClient, rawObj, info.Subresource == "status")
 					if err != nil {
 						responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 						return
 					}
 
-					responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusOK, updatedNode)
+					responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusOK, updatedNode, false)
 					return
 				}
 			} else if info.Verb == "patch" {
@@ -67,7 +67,7 @@ func WithNodeChanges(h http.Handler, uncachedLocalClient, uncachedVirtualClient 
 				}
 
 				if len(options.DryRun) == 0 {
-					patchNode(w, req, s, decoder, uncachedLocalClient, uncachedVirtualClient, virtualConfig, info.Subresource == "status")
+					patchNode(ctx, w, req, s, decoder, uncachedLocalClient, uncachedVirtualClient, virtualConfig, info.Subresource == "status")
 					return
 				}
 			}
@@ -77,7 +77,7 @@ func WithNodeChanges(h http.Handler, uncachedLocalClient, uncachedVirtualClient 
 	})
 }
 
-func patchNode(w http.ResponseWriter, req *http.Request, s runtime.NegotiatedSerializer, decoder encoding.Decoder, localClient client.Client, virtualClient client.Client, virtualConfig *rest.Config, status bool) {
+func patchNode(ctx context.Context, w http.ResponseWriter, req *http.Request, s runtime.NegotiatedSerializer, decoder encoding.Decoder, localClient client.Client, virtualClient client.Client, virtualConfig *rest.Config, status bool) {
 	h, err := handler.Handler("", virtualConfig, nil)
 	if err != nil {
 		responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
@@ -88,27 +88,25 @@ func patchNode(w http.ResponseWriter, req *http.Request, s runtime.NegotiatedSer
 	q := req.URL.Query()
 	q.Add("dryRun", "All")
 	req.URL.RawQuery = q.Encode()
-	code, header, data, err := executeRequest(req, h)
+	code, header, data, err := ExecuteRequest(req, h)
 	if err != nil {
 		responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 		return
 	} else if code != http.StatusOK {
-		writeWithHeader(w, code, header, data)
+		WriteWithHeader(w, code, header, data)
 		return
 	}
 
-	vObj, err := updateNode(decoder, localClient, virtualClient, data, status)
+	vObj, err := updateNode(ctx, decoder, localClient, virtualClient, data, status)
 	if err != nil {
 		responsewriters.ErrorNegotiated(err, s, corev1.SchemeGroupVersion, w, req)
 		return
 	}
 
-	responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusOK, vObj)
+	responsewriters.WriteObjectNegotiated(s, negotiation.DefaultEndpointRestrictions, corev1.SchemeGroupVersion, w, req, http.StatusOK, vObj, false)
 }
 
-func updateNode(decoder encoding.Decoder, localClient client.Client, virtualClient client.Client, rawObj []byte, status bool) (runtime.Object, error) {
-	// make sure this gets done
-	ctx := context.Background()
+func updateNode(ctx context.Context, decoder encoding.Decoder, localClient client.Client, virtualClient client.Client, rawObj []byte, status bool) (runtime.Object, error) {
 	nodeGVK := corev1.SchemeGroupVersion.WithKind("Node")
 	vObj, err := decoder.Decode(rawObj, &nodeGVK)
 	if err != nil {
@@ -144,6 +142,7 @@ func updateNode(decoder encoding.Decoder, localClient client.Client, virtualClie
 	newNode := pNode.DeepCopy()
 	newNode.Labels = vNode.Labels
 	newNode.Spec.Taints = vNode.Spec.Taints
+	newNode.Spec.Unschedulable = vNode.Spec.Unschedulable
 	newNode.Status.Capacity = vNode.Status.Capacity
 
 	// if there are no changes, just return the provided object
@@ -166,7 +165,7 @@ func updateNode(decoder encoding.Decoder, localClient client.Client, virtualClie
 	}
 
 	// now let's wait for the virtual node to update
-	err = wait.PollImmediate(time.Second*4, time.Millisecond*200, func() (bool, error) {
+	err = wait.PollUntilContextTimeout(ctx, time.Second*4, time.Millisecond*200, true, func(ctx context.Context) (bool, error) {
 		updatedNode := &corev1.Node{}
 		err := virtualClient.Get(ctx, client.ObjectKey{Name: vNode.Name}, updatedNode)
 		if err != nil {

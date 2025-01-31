@@ -5,28 +5,26 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
-	context2 "github.com/loft-sh/vcluster/cmd/vcluster/context"
 	"github.com/loft-sh/vcluster/pkg/authentication/delegatingauthenticator"
+	"github.com/loft-sh/vcluster/pkg/authentication/platformauthenticator"
 	"github.com/loft-sh/vcluster/pkg/authorization/allowall"
 	"github.com/loft-sh/vcluster/pkg/authorization/delegatingauthorizer"
 	"github.com/loft-sh/vcluster/pkg/authorization/impersonationauthorizer"
 	"github.com/loft-sh/vcluster/pkg/authorization/kubeletauthorizer"
-	"github.com/loft-sh/vcluster/pkg/constants"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"github.com/loft-sh/vcluster/pkg/plugin"
 	"github.com/loft-sh/vcluster/pkg/server/cert"
 	"github.com/loft-sh/vcluster/pkg/server/filters"
 	"github.com/loft-sh/vcluster/pkg/server/handler"
-	"github.com/loft-sh/vcluster/pkg/util/blockingcacheclient"
+	servertypes "github.com/loft-sh/vcluster/pkg/server/types"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	"github.com/loft-sh/vcluster/pkg/util/pluginhookclient"
 	"github.com/loft-sh/vcluster/pkg/util/serverhelper"
-	"github.com/loft-sh/vcluster/pkg/util/translate"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apiserver/pkg/admission"
@@ -34,40 +32,45 @@ import (
 	webhookinit "k8s.io/apiserver/pkg/admission/plugin/webhook/initializer"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/mutating"
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/validating"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
 	unionauthentication "k8s.io/apiserver/pkg/authentication/request/union"
 	"k8s.io/apiserver/pkg/authorization/union"
+	"k8s.io/apiserver/pkg/endpoints/filterlatency"
+	genericapifilters "k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/apiserver/pkg/endpoints/request"
+	genericfeatures "k8s.io/apiserver/pkg/features"
 	"k8s.io/apiserver/pkg/server"
-	apifilters "k8s.io/apiserver/pkg/server/filters"
-	"k8s.io/apiserver/pkg/server/options"
+	genericfilters "k8s.io/apiserver/pkg/server/filters"
+	koptions "k8s.io/apiserver/pkg/server/options"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	flowcontrolrequest "k8s.io/apiserver/pkg/util/flowcontrol/request"
 	"k8s.io/apiserver/pkg/util/webhook"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Server is a http.Handler which proxies Kubernetes APIs to remote API server.
 type Server struct {
-	uncachedVirtualClient client.Client
-
-	currentNamespace       string
+	uncachedVirtualClient  client.Client
+	cachedVirtualClient    client.Client
 	currentNamespaceClient client.Client
-
-	certSyncer cert.Syncer
-	handler    *http.ServeMux
-
-	redirectResources   []delegatingauthorizer.GroupVersionResourceVerb
-	requestHeaderCaFile string
-	clientCaFile        string
+	certSyncer             cert.Syncer
+	handler                *http.ServeMux
+	currentNamespace       string
+	requestHeaderCaFile    string
+	clientCaFile           string
+	redirectResources      []delegatingauthorizer.GroupVersionResourceVerb
+	fakeKubeletIPs         bool
 }
 
 // NewServer creates and installs a new Server.
 // 'filter', if non-nil, protects requests to the api only.
-func NewServer(ctx *context2.ControllerContext, requestHeaderCaFile, clientCaFile string) (*Server, error) {
+func NewServer(ctx *synccontext.ControllerContext, requestHeaderCaFile, clientCaFile string) (*Server, error) {
+	registerCtx := ctx.ToRegisterContext()
 	localConfig := ctx.LocalManager.GetConfig()
 	virtualConfig := ctx.VirtualManager.GetConfig()
 	uncachedLocalClient, err := client.New(localConfig, client.Options{
@@ -85,47 +88,25 @@ func NewServer(ctx *context2.ControllerContext, requestHeaderCaFile, clientCaFil
 		return nil, err
 	}
 
-	cachedLocalClient, err := createCachedClient(ctx.Context, localConfig, ctx.CurrentNamespace, uncachedLocalClient.RESTMapper(), uncachedLocalClient.Scheme(), func(cache cache.Cache) error {
-		return cache.IndexField(ctx.Context, &corev1.Service{}, constants.IndexByClusterIP, func(object client.Object) []string {
-			svc := object.(*corev1.Service)
-			if len(svc.Labels) == 0 || svc.Labels[nodeservice.ServiceClusterLabel] != translate.Suffix {
-				return nil
-			}
+	// wrap clients
+	uncachedVirtualClient = pluginhookclient.WrapVirtualClient(uncachedVirtualClient)
+	uncachedLocalClient = pluginhookclient.WrapPhysicalClient(uncachedLocalClient)
 
-			return []string{svc.Spec.ClusterIP}
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	cachedVirtualClient, err := createCachedClient(ctx.Context, virtualConfig, corev1.NamespaceAll, uncachedVirtualClient.RESTMapper(), uncachedVirtualClient.Scheme(), func(cache cache.Cache) error {
-		err := cache.IndexField(ctx.Context, &corev1.PersistentVolumeClaim{}, constants.IndexByPhysicalName, func(rawObj client.Object) []string {
-			return []string{translator.ObjectPhysicalName(rawObj)}
-		})
-		if err != nil {
-			return err
-		}
-
-		return cache.IndexField(ctx.Context, &corev1.Pod{}, constants.IndexByPhysicalName, func(rawObj client.Object) []string {
-			return []string{translator.ObjectPhysicalName(rawObj)}
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	certSyncer, err := cert.NewSyncer(ctx.CurrentNamespace, cachedLocalClient, ctx.Options)
+	certSyncer, err := cert.NewSyncer(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "create cert syncer")
 	}
 
 	s := &Server{
 		uncachedVirtualClient: uncachedVirtualClient,
+		cachedVirtualClient:   ctx.VirtualManager.GetClient(),
 		certSyncer:            certSyncer,
 		handler:               http.NewServeMux(),
 
-		currentNamespace:       ctx.CurrentNamespace,
-		currentNamespaceClient: cachedLocalClient,
+		fakeKubeletIPs: ctx.Config.Networking.Advanced.ProxyKubelets.ByIP,
+
+		currentNamespace:       ctx.Config.WorkloadNamespace,
+		currentNamespaceClient: ctx.WorkloadNamespaceClient,
 
 		requestHeaderCaFile: requestHeaderCaFile,
 		clientCaFile:        clientCaFile,
@@ -159,21 +140,39 @@ func NewServer(ctx *context2.ControllerContext, requestHeaderCaFile, clientCaFil
 	}
 
 	// init plugins
-	admissionHandler, err := initAdmission(ctx.Context, virtualConfig)
+	admissionHandler, err := initAdmission(ctx, virtualConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "init admission")
 	}
 
 	h := handler.ImpersonatingHandler("", virtualConfig)
-	h = filters.WithServiceCreateRedirect(h, uncachedLocalClient, uncachedVirtualClient, virtualConfig, ctx.Options.TargetNamespace, ctx.Options.SyncLabels, ctx.Options.SyncServiceSelector)
-	h = filters.WithRedirect(h, localConfig, uncachedLocalClient.Scheme(), uncachedVirtualClient, admissionHandler, ctx.Options.TargetNamespace, s.redirectResources)
-	h = filters.WithMetricsProxy(h, localConfig, cachedVirtualClient, ctx.Options.TargetNamespace)
-	if ctx.Options.DeprecatedSyncNodeChanges {
-		h = filters.WithNodeChanges(h, uncachedLocalClient, uncachedVirtualClient, virtualConfig)
-	}
-	h = filters.WithFakeKubelet(h, localConfig, cachedVirtualClient, ctx.Options.TargetNamespace)
-	serverhelper.HandleRoute(s.handler, "/", h)
 
+	// pre hooks
+	for _, f := range ctx.PreServerHooks {
+		h = f(h, ctx)
+	}
+
+	h = filters.WithServiceCreateRedirect(h, registerCtx, uncachedLocalClient, uncachedVirtualClient)
+	h = filters.WithRedirect(h, registerCtx, uncachedVirtualClient, admissionHandler, s.redirectResources)
+	h = filters.WithMetricsProxy(h, registerCtx)
+
+	// inject apis
+	if ctx.Config.Sync.FromHost.Nodes.Enabled && ctx.Config.Sync.FromHost.Nodes.SyncBackChanges {
+		h = filters.WithNodeChanges(ctx, h, uncachedLocalClient, uncachedVirtualClient, virtualConfig)
+	}
+	h = filters.WithFakeKubelet(h, ctx.ToRegisterContext())
+	h = filters.WithK3sConnect(h)
+
+	if os.Getenv("DEBUG") == "true" {
+		h = filters.WithPprof(h)
+	}
+
+	// post hooks
+	for _, f := range ctx.PostServerHooks {
+		h = f(h, ctx)
+	}
+
+	serverhelper.HandleRoute(s.handler, "/", h)
 	return s, nil
 }
 
@@ -185,7 +184,7 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 		APIPrefixes:          sets.NewString("api", "apis"),
 		GrouplessAPIPrefixes: sets.NewString("api"),
 	}
-	serverConfig.LongRunningFunc = apifilters.BasicLongRunningRequestCheck(
+	serverConfig.LongRunningFunc = genericfilters.BasicLongRunningRequestCheck(
 		sets.NewString("watch", "proxy"),
 		sets.NewString("attach", "exec", "proxy", "log", "portforward"),
 	)
@@ -198,9 +197,14 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 		},
 	}
 	redirectAuthResources = append(redirectAuthResources, s.redirectResources...)
-	serverConfig.Authorization.Authorizer = union.New(kubeletauthorizer.New(s.uncachedVirtualClient), delegatingauthorizer.New(s.uncachedVirtualClient, redirectAuthResources, nil), impersonationauthorizer.New(s.uncachedVirtualClient), allowall.New())
+	serverConfig.Authorization.Authorizer = union.New(
+		kubeletauthorizer.New(s.uncachedVirtualClient),
+		delegatingauthorizer.New(s.uncachedVirtualClient, redirectAuthResources, nil),
+		impersonationauthorizer.New(s.uncachedVirtualClient),
+		allowall.New(),
+	)
 
-	sso := options.NewSecureServingOptions()
+	sso := koptions.NewSecureServingOptions()
 	sso.HTTP2MaxStreamsPerConnection = 1000
 	sso.ServerCert.GeneratedCert = s.certSyncer
 	sso.BindPort = port
@@ -210,7 +214,7 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 		return err
 	}
 
-	authOptions := options.NewDelegatingAuthenticationOptions()
+	authOptions := koptions.NewDelegatingAuthenticationOptions()
 	authOptions.RemoteKubeConfigFileOptional = true
 	authOptions.SkipInClusterLookup = true
 	authOptions.RequestHeader.ClientCAFile = s.requestHeaderCaFile
@@ -220,12 +224,19 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 		return err
 	}
 
-	// make sure the tokens are correctly authenticated
-	serverConfig.Authentication.Authenticator = unionauthentication.New(delegatingauthenticator.New(s.uncachedVirtualClient), serverConfig.Authentication.Authenticator)
+	// make sure the tokens are correctly authenticated. We use the following order:
+	// 1. try the service account token one first since it's cheap to check this.
+	// 2. try the extra authenticators like platform that might take longer
+	// 3. last is the certificate authenticator
+	authenticators := []authenticator.Request{}
+	authenticators = append(authenticators, delegatingauthenticator.New(s.uncachedVirtualClient))
+	authenticators = append(authenticators, platformauthenticator.Default)
+	authenticators = append(authenticators, serverConfig.Authentication.Authenticator)
+	serverConfig.Authentication.Authenticator = unionauthentication.NewFailOnError(authenticators...)
 
 	// create server
 	klog.Info("Starting tls proxy server at " + address + ":" + strconv.Itoa(port))
-	stopped, err := serverConfig.SecureServing.Serve(s.buildHandlerChain(serverConfig), serverConfig.RequestTimeout, stopChan)
+	stopped, _, err := serverConfig.SecureServing.Serve(s.buildHandlerChain(serverConfig), serverConfig.RequestTimeout, stopChan)
 	if err != nil {
 		return err
 	}
@@ -234,48 +245,108 @@ func (s *Server) ServeOnListenerTLS(address string, port int, stopChan <-chan st
 	return nil
 }
 
-func createCachedClient(ctx context.Context, config *rest.Config, namespace string, restMapper meta.RESTMapper, scheme *runtime.Scheme, registerIndices func(cache cache.Cache) error) (client.Client, error) {
-	// create the new cache
-	clientCache, err := cache.New(config, cache.Options{
-		Scheme:    scheme,
-		Mapper:    restMapper,
-		Namespace: namespace,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	// register indices
-	err = registerIndices(clientCache)
-	if err != nil {
-		return nil, err
-	}
-
-	// start cache
-	go func() {
-		err := clientCache.Start(ctx)
-		if err != nil {
-			panic(err)
-		}
-	}()
-	clientCache.WaitForCacheSync(ctx)
-
-	// create a client from cache
-	cachedVirtualClient, err := blockingcacheclient.NewCacheClient(clientCache, config, client.Options{
-		Scheme: scheme,
-		Mapper: restMapper,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return cachedVirtualClient, nil
+func (s *Server) buildHandlerChain(serverConfig *server.Config) http.Handler {
+	defaultHandler := DefaultBuildHandlerChain(s.handler, serverConfig)
+	defaultHandler = filters.WithNodeName(defaultHandler, s.currentNamespace, s.fakeKubeletIPs, s.cachedVirtualClient, s.currentNamespaceClient)
+	return defaultHandler
 }
 
-func (s *Server) buildHandlerChain(serverConfig *server.Config) http.Handler {
-	defaultHandler := server.DefaultBuildHandlerChain(s.handler, serverConfig)
-	defaultHandler = filters.WithNodeName(defaultHandler, s.currentNamespace, s.currentNamespaceClient)
-	return defaultHandler
+// Copied from "k8s.io/apiserver/pkg/server" package
+func DefaultBuildHandlerChain(apiHandler http.Handler, c *server.Config) http.Handler {
+	// adding here for plugins that request the req to be authorized
+	handler := plugin.DefaultManager.WithInterceptors(apiHandler)
+
+	handler = filterlatency.TrackCompleted(handler)
+	handler = genericapifilters.WithAuthorization(handler, c.Authorization.Authorizer, c.Serializer)
+	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "authorization")
+
+	if c.FlowControl != nil {
+		workEstimatorCfg := flowcontrolrequest.DefaultWorkEstimatorConfig()
+		requestWorkEstimator := flowcontrolrequest.NewWorkEstimator(
+			c.StorageObjectCountTracker.Get, c.FlowControl.GetInterestedWatchCount, workEstimatorCfg, c.FlowControl.GetMaxSeats)
+		handler = filterlatency.TrackCompleted(handler)
+		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl, requestWorkEstimator, c.RequestTimeout/4)
+		handler = filterlatency.TrackStarted(handler, c.TracerProvider, "priorityandfairness")
+	} else {
+		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
+	}
+
+	handler = filterlatency.TrackCompleted(handler)
+	handler = genericapifilters.WithImpersonation(handler, c.Authorization.Authorizer, c.Serializer)
+	// @matskiv: save the user.Info object before impersonation which might override it
+	handler = WithOriginalUser(handler)
+	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "impersonation")
+
+	handler = filterlatency.TrackCompleted(handler)
+	handler = genericapifilters.WithAudit(handler, c.AuditBackend, c.AuditPolicyRuleEvaluator, c.LongRunningFunc)
+	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "audit")
+
+	failedHandler := genericapifilters.Unauthorized(c.Serializer)
+	failedHandler = genericapifilters.WithFailedAuthenticationAudit(failedHandler, c.AuditBackend, c.AuditPolicyRuleEvaluator)
+
+	failedHandler = filterlatency.TrackCompleted(failedHandler)
+	handler = filterlatency.TrackCompleted(handler)
+	handler = genericapifilters.WithAuthentication(handler, c.Authentication.Authenticator, failedHandler, c.Authentication.APIAudiences, c.Authentication.RequestHeaderConfig)
+	handler = filterlatency.TrackStarted(handler, c.TracerProvider, "authentication")
+
+	handler = genericfilters.WithCORS(handler, c.CorsAllowedOriginList, nil, nil, nil, "true")
+
+	// WithTimeoutForNonLongRunningRequests will call the rest of the request handling in a go-routine with the
+	// context with deadline. The go-routine can keep running, while the timeout logic will return a timeout to the client.
+	handler = genericfilters.WithTimeoutForNonLongRunningRequests(handler, c.LongRunningFunc)
+
+	handler = genericapifilters.WithRequestDeadline(handler, c.AuditBackend, c.AuditPolicyRuleEvaluator,
+		c.LongRunningFunc, c.Serializer, c.RequestTimeout)
+	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.NonLongRunningRequestWaitGroup)
+
+	// @matskiv: In our case the c.ShutdownWatchTerminationGracePeriod is 0, so we will ignore this branch,
+	// otherwise the fact that c.lifecycleSignals is private would be a problem.
+	// if c.ShutdownWatchTerminationGracePeriod > 0 {
+	// 	handler = genericfilters.WithWatchTerminationDuringShutdown(handler, c.lifecycleSignals, c.WatchRequestWaitGroup)
+	// }
+	if c.SecureServing != nil && !c.SecureServing.DisableHTTP2 && c.GoawayChance > 0 {
+		handler = genericfilters.WithProbabilisticGoaway(handler, c.GoawayChance)
+	}
+	handler = genericapifilters.WithWarningRecorder(handler)
+	handler = genericapifilters.WithCacheControl(handler)
+	handler = genericfilters.WithHSTS(handler, c.HSTSDirectives)
+
+	// @matskiv: In our case the c.ShutdownSendRetryAfter is false, so we will ignore this branch,
+	// otherwise the fact that c.lifecycleSignals is private would be a problem.
+	// if c.ShutdownSendRetryAfter {
+	// 	handler = genericfilters.WithRetryAfter(handler, c.lifecycleSignals.NotAcceptingNewRequest.Signaled())
+	// }
+	handler = genericfilters.WithHTTPLogging(handler)
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
+		handler = genericapifilters.WithTracing(handler, c.TracerProvider)
+	}
+	handler = genericapifilters.WithLatencyTrackers(handler)
+
+	// this is for the plugins to be able to catch the requests with the info in the
+	// context
+	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
+	handler = genericapifilters.WithRequestReceivedTimestamp(handler)
+
+	// @matskiv: In our case the channel returned by the c.lifecycleSignals.MuxAndDiscoveryComplete.Signaled()
+	// is never closed because we are not using the code that would usually close it. We will pass a dummy channel
+	// to get the same outcome.
+	// Original line:
+	// handler = genericapifilters.WithMuxAndDiscoveryComplete(handler, c.lifecycleSignals.MuxAndDiscoveryComplete.Signaled())
+	handler = genericapifilters.WithMuxAndDiscoveryComplete(handler, make(chan struct{}))
+	handler = genericfilters.WithPanicRecovery(handler, c.RequestInfoResolver)
+	handler = genericapifilters.WithAuditInit(handler)
+	return handler
+}
+
+func WithOriginalUser(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		user, ok := request.UserFrom(req.Context())
+		if ok {
+			req = req.WithContext(context.WithValue(req.Context(), servertypes.OriginalUserKey, user))
+		}
+
+		h.ServeHTTP(w, req)
+	})
 }
 
 func initAdmission(ctx context.Context, vConfig *rest.Config) (admission.Interface, error) {
@@ -288,7 +359,7 @@ func initAdmission(ctx context.Context, vConfig *rest.Config) (admission.Interfa
 	serviceResolver := aggregatorapiserver.NewClusterIPServiceResolver(
 		kubeInformerFactory.Core().V1().Services().Lister(),
 	)
-	authInfoResolverWrapper := func(resolver webhook.AuthenticationInfoResolver) webhook.AuthenticationInfoResolver {
+	authInfoResolverWrapper := func(_ webhook.AuthenticationInfoResolver) webhook.AuthenticationInfoResolver {
 		return &kubeConfigProvider{
 			vConfig: vConfig,
 		}
@@ -305,7 +376,7 @@ func initAdmission(ctx context.Context, vConfig *rest.Config) (admission.Interfa
 		&emptyConfigProvider{},
 		admission.PluginInitializers{
 			webhookinit.NewPluginInitializer(authInfoResolverWrapper, serviceResolver),
-			initializer.New(vClient, kubeInformerFactory, nil, nil),
+			initializer.New(vClient, nil, kubeInformerFactory, nil, nil, nil, nil),
 		},
 		nil,
 	)
@@ -347,6 +418,7 @@ func setGlobalDefaults(config *rest.Config) *rest.Config {
 
 type emptyConfigProvider struct{}
 
-func (e *emptyConfigProvider) ConfigFor(pluginName string) (io.Reader, error) {
+func (e *emptyConfigProvider) ConfigFor(_ string) (io.Reader, error) {
+	//nolint:nilnil
 	return nil, nil
 }

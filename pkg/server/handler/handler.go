@@ -1,17 +1,18 @@
 package handler
 
 import (
-	utilnet "k8s.io/apimachinery/pkg/util/net"
-	"k8s.io/apimachinery/pkg/util/proxy"
-	"k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/transport"
-	"k8s.io/klog"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/proxy"
+	"k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/transport"
+	"k8s.io/klog/v2"
 )
 
 func ImpersonatingHandler(prefix string, cfg *rest.Config) http.Handler {
@@ -44,7 +45,7 @@ func impersonate(rw http.ResponseWriter, req *http.Request, prefix string, cfg *
 
 type responder struct{}
 
-func (r *responder) Error(w http.ResponseWriter, req *http.Request, err error) {
+func (r *responder) Error(w http.ResponseWriter, _ *http.Request, err error) {
 	klog.Errorf("Error while proxying request: %v", err)
 	http.Error(w, err.Error(), http.StatusInternalServerError)
 }

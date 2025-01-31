@@ -20,7 +20,6 @@ import (
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/pod-security-admission/api"
@@ -35,6 +34,9 @@ spec.containers[*].securityContext.procMount
 spec.initContainers[*].securityContext.procMount
 
 **Allowed Values:** undefined/null, "Default"
+
+However, if the pod is in a user namespace (`hostUsers: false`), and the
+UserNamespacesPodSecurityStandards feature is enabled, all values are allowed.
 
 */
 
@@ -59,6 +61,14 @@ func CheckProcMount() Check {
 }
 
 func procMount_1_0(podMetadata *metav1.ObjectMeta, podSpec *corev1.PodSpec) CheckResult {
+	// TODO: When we remove the UserNamespacesPodSecurityStandards feature gate (and GA this relaxation),
+	// create a new policy version.
+	// Note: pod validation will check for well formed procMount type, so avoid double validation and allow everything
+	// here.
+	if relaxPolicyForUserNamespacePod(podSpec) {
+		return CheckResult{Allowed: true}
+	}
+
 	var badContainers []string
 	forbiddenProcMountTypes := sets.NewString()
 	visitContainers(podSpec, func(container *corev1.Container) {
@@ -71,7 +81,7 @@ func procMount_1_0(podMetadata *metav1.ObjectMeta, podSpec *corev1.PodSpec) Chec
 			return
 		}
 		// check if the value of the proc mount type is valid.
-		if *container.SecurityContext.ProcMount != v1.DefaultProcMount {
+		if *container.SecurityContext.ProcMount != corev1.DefaultProcMount {
 			badContainers = append(badContainers, container.Name)
 			forbiddenProcMountTypes.Insert(string(*container.SecurityContext.ProcMount))
 		}
