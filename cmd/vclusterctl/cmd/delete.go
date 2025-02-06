@@ -1,28 +1,25 @@
 package cmd
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"os/exec"
 
-	"github.com/pkg/errors"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-
-	"github.com/loft-sh/vcluster/cmd/vclusterctl/flags"
-	"github.com/loft-sh/vcluster/cmd/vclusterctl/log"
-	"github.com/loft-sh/vcluster/pkg/helm"
+	"github.com/loft-sh/log"
+	"github.com/loft-sh/vcluster/pkg/cli"
+	"github.com/loft-sh/vcluster/pkg/cli/completion"
+	"github.com/loft-sh/vcluster/pkg/cli/config"
+	"github.com/loft-sh/vcluster/pkg/cli/flags"
+	flagsdelete "github.com/loft-sh/vcluster/pkg/cli/flags/delete"
+	"github.com/loft-sh/vcluster/pkg/cli/util"
+	"github.com/loft-sh/vcluster/pkg/platform"
 	"github.com/spf13/cobra"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-// DeleteCmd holds the login cmd flags
+// DeleteCmd holds the delete cmd flags
 type DeleteCmd struct {
 	*flags.GlobalFlags
-
-	KeepPVC         bool
-	DeleteNamespace bool
+	cli.DeleteOptions
 
 	log log.Logger
 }
@@ -35,10 +32,9 @@ func NewDeleteCmd(globalFlags *flags.GlobalFlags) *cobra.Command {
 	}
 
 	cobraCmd := &cobra.Command{
-		Use:   "delete",
+		Use:   "delete" + util.VClusterNameOnlyUseLine,
 		Short: "Deletes a virtual cluster",
-		Long: `
-#######################################################
+		Long: `#######################################################
 ################### vcluster delete ###################
 #######################################################
 Deletes a virtual cluster
@@ -47,105 +43,42 @@ Example:
 vcluster delete test --namespace test
 #######################################################
 	`,
-		Args: cobra.ExactArgs(1),
+		Args:              util.VClusterNameOnlyValidator,
+		Aliases:           []string{"rm"},
+		ValidArgsFunction: completion.NewValidVClusterNameFunc(globalFlags),
 		RunE: func(cobraCmd *cobra.Command, args []string) error {
-			return cmd.Run(cobraCmd, args)
+			return cmd.Run(cobraCmd.Context(), args)
 		},
 	}
 
-	cobraCmd.Flags().BoolVar(&cmd.KeepPVC, "keep-pvc", false, "If enabled, vcluster will not delete the persistent volume claim of the vcluster")
-	cobraCmd.Flags().BoolVar(&cmd.DeleteNamespace, "delete-namespace", false, "If enabled, vcluster will delete the namespace of the vcluster")
+	cobraCmd.Flags().StringVar(&cmd.Driver, "driver", "", "The driver to use for managing the virtual cluster, can be either helm or platform.")
+
+	flagsdelete.AddCommonFlags(cobraCmd, &cmd.DeleteOptions)
+	flagsdelete.AddHelmFlags(cobraCmd, &cmd.DeleteOptions)
+	flagsdelete.AddPlatformFlags(cobraCmd, &cmd.DeleteOptions, "[PLATFORM] ")
+
 	return cobraCmd
 }
 
 // Run executes the functionality
-func (cmd *DeleteCmd) Run(cobraCmd *cobra.Command, args []string) error {
-	// test for helm
-	_, err := exec.LookPath("helm")
+func (cmd *DeleteCmd) Run(ctx context.Context, args []string) error {
+	cfg := cmd.LoadedConfig(cmd.log)
+
+	// If driver has been passed as flag use it, otherwise read it from the config file
+	driverType, err := config.ParseDriverType(cmp.Or(cmd.Driver, string(cfg.Driver.Type)))
 	if err != nil {
-		return fmt.Errorf("seems like helm is not installed. Helm is required for the deletion of a virtual cluster. Please visit https://helm.sh/docs/intro/install/ for install instructions")
+		return fmt.Errorf("parse driver type: %w", err)
 	}
 
-	output, err := exec.Command("helm", "version").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("seems like there are issues with your helm client: \n\n%s", output)
+	// check if there is a platform client or we skip the info message
+	_, err = platform.InitClientFromConfig(ctx, cfg)
+	if err == nil {
+		config.PrintDriverInfo("delete", driverType, cmd.log)
 	}
 
-	// first load the kube config
-	kubeClientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{
-		CurrentContext: cmd.Context,
-	})
-
-	// load the raw config
-	rawConfig, err := kubeClientConfig.RawConfig()
-	if err != nil {
-		return fmt.Errorf("there is an error loading your current kube config (%v), please make sure you have access to a kubernetes cluster and the command `kubectl get namespaces` is working", err)
-	}
-	if cmd.Context != "" {
-		rawConfig.CurrentContext = cmd.Context
+	if driverType == config.PlatformDriver {
+		return cli.DeletePlatform(ctx, &cmd.DeleteOptions, cfg, args[0], cmd.log)
 	}
 
-	namespace, _, err := kubeClientConfig.Namespace()
-	if err != nil {
-		return err
-	} else if namespace == "" {
-		namespace = "default"
-	}
-	if cmd.Namespace != "" {
-		namespace = cmd.Namespace
-	}
-
-	// we have to delete the chart
-	err = helm.NewClient(&rawConfig, cmd.log).Delete(args[0], namespace)
-	if err != nil {
-		return err
-	}
-	cmd.log.Donef("Successfully deleted virtual cluster %s in namespace %s", args[0], namespace)
-
-	// try to delete the pvc
-	if !cmd.KeepPVC {
-		pvcName := fmt.Sprintf("data-%s-0", args[0])
-		restConfig, err := kubeClientConfig.ClientConfig()
-		if err != nil {
-			return err
-		}
-
-		client, err := kubernetes.NewForConfig(restConfig)
-		if err != nil {
-			return err
-		}
-
-		err = client.CoreV1().PersistentVolumeClaims(namespace).Delete(context.Background(), pvcName, metav1.DeleteOptions{})
-		if err != nil {
-			if !kerrors.IsNotFound(err) {
-				return errors.Wrap(err, "delete pvc")
-			}
-		} else {
-			cmd.log.Donef("Successfully deleted virtual cluster pvc %s in namespace %s", pvcName, namespace)
-		}
-	}
-
-	// try to delete the namespace
-	if cmd.DeleteNamespace {
-		restConfig, err := kubeClientConfig.ClientConfig()
-		if err != nil {
-			return err
-		}
-
-		client, err := kubernetes.NewForConfig(restConfig)
-		if err != nil {
-			return err
-		}
-
-		err = client.CoreV1().Namespaces().Delete(context.Background(), namespace, metav1.DeleteOptions{})
-		if err != nil {
-			if !kerrors.IsNotFound(err) {
-				return errors.Wrap(err, "delete namespace")
-			}
-		} else {
-			cmd.log.Donef("Successfully deleted virtual cluster namespace %s", namespace)
-		}
-	}
-
-	return nil
+	return cli.DeleteHelm(ctx, &cmd.DeleteOptions, cmd.GlobalFlags, args[0], cmd.log)
 }

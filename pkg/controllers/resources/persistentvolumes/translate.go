@@ -1,36 +1,35 @@
 package persistentvolumes
 
 import (
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/types"
 )
 
-func (s *persistentVolumeSyncer) translate(ctx *synccontext.SyncContext, vPv *corev1.PersistentVolume) *corev1.PersistentVolume {
+func (s *persistentVolumeSyncer) translate(ctx *synccontext.SyncContext, vPv *corev1.PersistentVolume) (*corev1.PersistentVolume, error) {
 	// translate the persistent volume
-	pPV := s.TranslateMetadata(vPv).(*corev1.PersistentVolume)
+	pPV := translate.HostMetadata(vPv, s.VirtualToHost(ctx, types.NamespacedName{Name: vPv.GetName()}, vPv), s.excludedAnnotations...)
 	pPV.Spec.ClaimRef = nil
-	pPV.Spec.StorageClassName = translateStorageClass(ctx.TargetNamespace, vPv.Spec.StorageClassName)
 
 	// TODO: translate the storage secrets
-	return pPV
-}
-
-func translateStorageClass(physicalNamespace, vStorageClassName string) string {
-	if vStorageClassName == "" {
-		return ""
+	if pPV.Spec.StorageClassName != "" {
+		pPV.Spec.StorageClassName = translate.Default.HostNameCluster(vPv.Spec.StorageClassName)
 	}
-	return translate.PhysicalNameClusterScoped(vStorageClassName, physicalNamespace)
+	return pPV, nil
 }
 
 func (s *persistentVolumeSyncer) translateBackwards(pPv *corev1.PersistentVolume, vPvc *corev1.PersistentVolumeClaim) *corev1.PersistentVolume {
 	// build virtual persistent volume
-	vObj := pPv.DeepCopy()
-	vObj.ResourceVersion = ""
-	vObj.UID = ""
-	vObj.ManagedFields = nil
+	vObj := translate.CopyObjectWithName(pPv, types.NamespacedName{Name: pPv.Name}, false, s.excludedAnnotations...)
 	if vPvc != nil {
+		if vObj.Spec.ClaimRef == nil {
+			vObj.Spec.ClaimRef = &corev1.ObjectReference{}
+		}
+
 		vObj.Spec.ClaimRef.ResourceVersion = vPvc.ResourceVersion
 		vObj.Spec.ClaimRef.UID = vPvc.UID
 		vObj.Spec.ClaimRef.Name = vPvc.Name
@@ -42,16 +41,19 @@ func (s *persistentVolumeSyncer) translateBackwards(pPv *corev1.PersistentVolume
 	if vObj.Annotations == nil {
 		vObj.Annotations = map[string]string{}
 	}
-	vObj.Annotations[HostClusterPersistentVolumeAnnotation] = pPv.Name
+	vObj.Annotations[constants.HostClusterPersistentVolumeAnnotation] = pPv.Name
 	return vObj
 }
 
-func (s *persistentVolumeSyncer) translateUpdateBackwards(ctx *synccontext.SyncContext, vPv *corev1.PersistentVolume, pPv *corev1.PersistentVolume, vPvc *corev1.PersistentVolumeClaim) *corev1.PersistentVolume {
-	var updated *corev1.PersistentVolume
-
+func (s *persistentVolumeSyncer) translateUpdateBackwards(ctx *synccontext.SyncContext, vPv *corev1.PersistentVolume, pPv *corev1.PersistentVolume, vPvc *corev1.PersistentVolumeClaim) error {
 	// build virtual persistent volume
 	translatedSpec := *pPv.Spec.DeepCopy()
+	isStorageClassCreatedOnVirtual, isClaimRefCreatedOnVirtual := false, false
 	if vPvc != nil {
+		if translatedSpec.ClaimRef == nil {
+			translatedSpec.ClaimRef = &corev1.ObjectReference{}
+		}
+
 		translatedSpec.ClaimRef.ResourceVersion = vPvc.ResourceVersion
 		translatedSpec.ClaimRef.UID = vPvc.UID
 		translatedSpec.ClaimRef.Name = vPvc.Name
@@ -59,84 +61,35 @@ func (s *persistentVolumeSyncer) translateUpdateBackwards(ctx *synccontext.SyncC
 		if vPvc.Spec.StorageClassName != nil {
 			translatedSpec.StorageClassName = *vPvc.Spec.StorageClassName
 		}
-	}
+		// when the PVC gets deleted
+	} else {
+		// check if SC was created on virtual
+		isStorageClassCreatedOnVirtual = vPv.Spec.StorageClassName != mappings.VirtualToHostName(ctx, vPv.Spec.StorageClassName, "", mappings.StorageClasses())
 
-	// check storage class
-	if !translate.IsManagedCluster(ctx.TargetNamespace, pPv) {
-		if !equality.Semantic.DeepEqual(vPv.Spec.StorageClassName, translatedSpec.StorageClassName) {
-			updated = newIfNil(updated, vPv)
-			updated.Spec.StorageClassName = translatedSpec.StorageClassName
+		// check if claim was created on virtual
+		if vPv.Spec.ClaimRef != nil && translatedSpec.ClaimRef != nil {
+			var claimRef types.NamespacedName
+			if vPv.Spec.ClaimRef.Kind == "PersistentVolume" {
+				claimRef = mappings.VirtualToHost(ctx, vPv.Spec.ClaimRef.Name, vPv.Spec.ClaimRef.Namespace, mappings.PersistentVolumes())
+			} else {
+				claimRef = mappings.VirtualToHost(ctx, vPv.Spec.ClaimRef.Name, vPv.Spec.ClaimRef.Namespace, mappings.PersistentVolumeClaims())
+			}
+
+			isClaimRefCreatedOnVirtual = claimRef.Name == translatedSpec.ClaimRef.Name && claimRef.Namespace == translatedSpec.ClaimRef.Namespace
 		}
 	}
 
-	// check claim ref
-	if !equality.Semantic.DeepEqual(vPv.Spec.ClaimRef, translatedSpec.ClaimRef) {
-		updated = newIfNil(updated, vPv)
-		updated.Spec.ClaimRef = translatedSpec.ClaimRef
+	// check storage class. Do not copy the name, if it was created on virtual.
+	if !translate.Default.IsManaged(ctx, pPv) {
+		if !equality.Semantic.DeepEqual(vPv.Spec.StorageClassName, translatedSpec.StorageClassName) && !isStorageClassCreatedOnVirtual {
+			vPv.Spec.StorageClassName = translatedSpec.StorageClassName
+		}
 	}
 
-	return updated
-}
-
-func (s *persistentVolumeSyncer) translateUpdate(ctx *synccontext.SyncContext, vPv *corev1.PersistentVolume, pPv *corev1.PersistentVolume) *corev1.PersistentVolume {
-	var updated *corev1.PersistentVolume
-
-	// TODO: translate the storage secrets
-	if !equality.Semantic.DeepEqual(pPv.Spec.PersistentVolumeSource, vPv.Spec.PersistentVolumeSource) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.PersistentVolumeSource = vPv.Spec.PersistentVolumeSource
+	// check claim ref. Do not copy, if it was created on virtual.
+	if !equality.Semantic.DeepEqual(vPv.Spec.ClaimRef, translatedSpec.ClaimRef) && !isClaimRefCreatedOnVirtual {
+		vPv.Spec.ClaimRef = translatedSpec.ClaimRef
 	}
 
-	if !equality.Semantic.DeepEqual(pPv.Spec.Capacity, vPv.Spec.Capacity) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.Capacity = vPv.Spec.Capacity
-	}
-
-	if !equality.Semantic.DeepEqual(pPv.Spec.AccessModes, vPv.Spec.AccessModes) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.AccessModes = vPv.Spec.AccessModes
-	}
-
-	if !equality.Semantic.DeepEqual(pPv.Spec.PersistentVolumeReclaimPolicy, vPv.Spec.PersistentVolumeReclaimPolicy) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.PersistentVolumeReclaimPolicy = vPv.Spec.PersistentVolumeReclaimPolicy
-	}
-
-	translatedStorageClassName := translateStorageClass(ctx.TargetNamespace, vPv.Spec.StorageClassName)
-	if !equality.Semantic.DeepEqual(pPv.Spec.StorageClassName, translatedStorageClassName) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.StorageClassName = translatedStorageClassName
-	}
-
-	if !equality.Semantic.DeepEqual(pPv.Spec.NodeAffinity, vPv.Spec.NodeAffinity) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.NodeAffinity = vPv.Spec.NodeAffinity
-	}
-
-	if !equality.Semantic.DeepEqual(pPv.Spec.VolumeMode, vPv.Spec.VolumeMode) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.VolumeMode = vPv.Spec.VolumeMode
-	}
-
-	if !equality.Semantic.DeepEqual(pPv.Spec.MountOptions, vPv.Spec.MountOptions) {
-		updated = newIfNil(updated, pPv)
-		updated.Spec.MountOptions = vPv.Spec.MountOptions
-	}
-
-	// check labels & annotations
-	changed, updatedAnnotations, updatedLabels := s.TranslateMetadataUpdate(vPv, pPv)
-	if changed {
-		updated = newIfNil(updated, pPv)
-		updated.Annotations = updatedAnnotations
-		updated.Labels = updatedLabels
-	}
-
-	return updated
-}
-
-func newIfNil(updated *corev1.PersistentVolume, obj *corev1.PersistentVolume) *corev1.PersistentVolume {
-	if updated == nil {
-		return obj.DeepCopy()
-	}
-	return updated
+	return nil
 }

@@ -1,41 +1,51 @@
 package persistentvolumeclaims
 
 import (
-	"context"
-	"fmt"
 	"github.com/loft-sh/vcluster/pkg/constants"
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer/translator"
+	"github.com/loft-sh/vcluster/pkg/mappings"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
 	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/types"
 )
 
-var (
-	deprecatedStorageClassAnnotation = "volume.beta.kubernetes.io/storage-class"
-)
+var deprecatedStorageClassAnnotation = "volume.beta.kubernetes.io/storage-class"
 
 func (s *persistentVolumeClaimSyncer) translate(ctx *synccontext.SyncContext, vPvc *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, error) {
-	newPvc := s.TranslateMetadata(vPvc).(*corev1.PersistentVolumeClaim)
-	newPvc, err := s.translateSelector(ctx, newPvc)
-	if err != nil {
-		return nil, err
-	}
-	if newPvc.Spec.DataSource != nil && vPvc.Annotations[constants.SkipTranslationAnnotation] != "true" &&
-		(newPvc.Spec.DataSource.Kind == "PersistentVolumeClaim" || newPvc.Spec.DataSource.Kind == "VolumeSnapshot") {
-		newPvc.Spec.DataSource.Name = translate.PhysicalName(newPvc.Spec.DataSource.Name, vPvc.Namespace)
+	pPVC := translate.HostMetadata(vPvc, s.VirtualToHost(ctx, types.NamespacedName{Name: vPvc.GetName(), Namespace: vPvc.GetNamespace()}, vPvc), s.excludedAnnotations...)
+	s.translateSelector(ctx, pPVC)
+
+	if vPvc.Annotations[constants.SkipTranslationAnnotation] != "true" {
+		if pPVC.Spec.DataSource != nil {
+			switch pPVC.Spec.DataSource.Kind {
+			case "VolumeSnapshot":
+				pPVC.Spec.DataSource.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSource.Name, vPvc.Namespace, mappings.VolumeSnapshots())
+			case "PersistentVolumeClaim":
+				pPVC.Spec.DataSource.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSource.Name, vPvc.Namespace, mappings.PersistentVolumeClaims())
+			}
+		}
+
+		if pPVC.Spec.DataSourceRef != nil {
+			namespace := vPvc.Namespace
+			if pPVC.Spec.DataSourceRef.Namespace != nil {
+				namespace = *pPVC.Spec.DataSourceRef.Namespace
+			}
+
+			switch pPVC.Spec.DataSourceRef.Kind {
+			case "VolumeSnapshot":
+				pPVC.Spec.DataSourceRef.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSourceRef.Name, namespace, mappings.VolumeSnapshots())
+			case "PersistentVolumeClaim":
+				pPVC.Spec.DataSourceRef.Name = mappings.VirtualToHostName(ctx, pPVC.Spec.DataSourceRef.Name, namespace, mappings.PersistentVolumeClaims())
+			}
+		}
 	}
 
-	//TODO: add support for the .Spec.DataSourceRef field
-	return newPvc, nil
+	return pPVC, nil
 }
 
-func (s *persistentVolumeClaimSyncer) translateSelector(ctx *synccontext.SyncContext, vPvc *corev1.PersistentVolumeClaim) (*corev1.PersistentVolumeClaim, error) {
-	vPvc = vPvc.DeepCopy()
-
+func (s *persistentVolumeClaimSyncer) translateSelector(ctx *synccontext.SyncContext, vPvc *corev1.PersistentVolumeClaim) {
 	storageClassName := ""
 	if vPvc.Spec.StorageClassName != nil && *vPvc.Spec.StorageClassName != "" {
 		storageClassName = *vPvc.Spec.StorageClassName
@@ -44,111 +54,58 @@ func (s *persistentVolumeClaimSyncer) translateSelector(ctx *synccontext.SyncCon
 	}
 
 	// translate storage class if we manage those in vcluster
-	if s.storageClassesEnabled {
-		if storageClassName == "" && vPvc.Spec.Selector == nil && vPvc.Spec.VolumeName == "" {
-			return nil, fmt.Errorf("no storage class defined for pvc %s/%s", vPvc.Namespace, vPvc.Name)
-		}
-
-		// translate storage class name if there is any
-		if storageClassName != "" {
-			translated := translate.PhysicalNameClusterScoped(storageClassName, ctx.TargetNamespace)
-			delete(vPvc.Annotations, deprecatedStorageClassAnnotation)
-			vPvc.Spec.StorageClassName = &translated
-		}
+	if s.storageClassesEnabled && storageClassName != "" {
+		translated := translate.Default.HostNameCluster(storageClassName)
+		delete(vPvc.Annotations, deprecatedStorageClassAnnotation)
+		vPvc.Spec.StorageClassName = &translated
 	}
 
 	// translate selector & volume name
 	if !s.useFakePersistentVolumes {
 		if vPvc.Annotations == nil || vPvc.Annotations[constants.SkipTranslationAnnotation] != "true" {
 			if vPvc.Spec.Selector != nil {
-				vPvc.Spec.Selector = translator.TranslateLabelSelectorCluster(ctx.TargetNamespace, vPvc.Spec.Selector)
+				vPvc.Spec.Selector = translate.HostLabelSelector(vPvc.Spec.Selector)
 			}
 			if vPvc.Spec.VolumeName != "" {
-				vPvc.Spec.VolumeName = translate.PhysicalNameClusterScoped(vPvc.Spec.VolumeName, ctx.TargetNamespace)
+				vPvc.Spec.VolumeName = translate.Default.HostNameCluster(vPvc.Spec.VolumeName)
 			}
 			// check if the storage class exists in the physical cluster
 			if !s.storageClassesEnabled && storageClassName != "" {
 				// Should the PVC be dynamically provisioned or not?
 				if vPvc.Spec.Selector == nil && vPvc.Spec.VolumeName == "" {
-					err := ctx.PhysicalClient.Get(context.TODO(), types.NamespacedName{Name: storageClassName}, &storagev1.StorageClass{})
+					err := ctx.PhysicalClient.Get(ctx, types.NamespacedName{Name: storageClassName}, &storagev1.StorageClass{})
 					if err != nil && kerrors.IsNotFound(err) {
-						translated := translate.PhysicalNameClusterScoped(storageClassName, ctx.TargetNamespace)
+						translated := translate.Default.HostNameCluster(storageClassName)
 						delete(vPvc.Annotations, deprecatedStorageClassAnnotation)
 						vPvc.Spec.StorageClassName = &translated
 					}
 				} else {
-					translated := translate.PhysicalNameClusterScoped(storageClassName, ctx.TargetNamespace)
+					translated := translate.Default.HostNameCluster(storageClassName)
 					delete(vPvc.Annotations, deprecatedStorageClassAnnotation)
 					vPvc.Spec.StorageClassName = &translated
 				}
 			}
 		}
 	}
-	return vPvc, nil
 }
 
-func (s *persistentVolumeClaimSyncer) translateUpdate(pObj, vObj *corev1.PersistentVolumeClaim) *corev1.PersistentVolumeClaim {
-	var updated *corev1.PersistentVolumeClaim
-
-	// allow storage size to be increased
-	if pObj.Spec.Resources.Requests["storage"] != vObj.Spec.Resources.Requests["storage"] {
-		updated = newIfNil(updated, pObj)
-		if updated.Spec.Resources.Requests == nil {
-			updated.Spec.Resources.Requests = make(map[corev1.ResourceName]resource.Quantity)
+func (s *persistentVolumeClaimSyncer) translateUpdateBackwards(pObj, vObj *corev1.PersistentVolumeClaim) {
+	if vObj.Annotations[bindCompletedAnnotation] != pObj.Annotations[bindCompletedAnnotation] {
+		if vObj.Annotations == nil {
+			vObj.Annotations = map[string]string{}
 		}
-		updated.Spec.Resources.Requests["storage"] = vObj.Spec.Resources.Requests["storage"]
+		vObj.Annotations[bindCompletedAnnotation] = pObj.Annotations[bindCompletedAnnotation]
 	}
-
-	changed, updatedAnnotations, updatedLabels := s.TranslateMetadataUpdate(vObj, pObj)
-	if changed {
-		updated = newIfNil(updated, pObj)
-		updated.Annotations = updatedAnnotations
-		updated.Labels = updatedLabels
-	}
-
-	return updated
-}
-
-func (s *persistentVolumeClaimSyncer) translateUpdateBackwards(pObj, vObj *corev1.PersistentVolumeClaim) *corev1.PersistentVolumeClaim {
-	var updated *corev1.PersistentVolumeClaim
-
-	// check for metadata annotations
-	if translateUpdateNeeded(pObj.Annotations, vObj.Annotations) {
-		updated = newIfNil(updated, vObj)
-		if updated.Annotations == nil {
-			updated.Annotations = map[string]string{}
+	if vObj.Annotations[boundByControllerAnnotation] != pObj.Annotations[boundByControllerAnnotation] {
+		if vObj.Annotations == nil {
+			vObj.Annotations = map[string]string{}
 		}
-
-		if updated.Annotations[bindCompletedAnnotation] != pObj.Annotations[bindCompletedAnnotation] {
-			updated.Annotations[bindCompletedAnnotation] = pObj.Annotations[bindCompletedAnnotation]
+		vObj.Annotations[boundByControllerAnnotation] = pObj.Annotations[boundByControllerAnnotation]
+	}
+	if vObj.Annotations[storageProvisionerAnnotation] != pObj.Annotations[storageProvisionerAnnotation] {
+		if vObj.Annotations == nil {
+			vObj.Annotations = map[string]string{}
 		}
-		if updated.Annotations[boundByControllerAnnotation] != pObj.Annotations[boundByControllerAnnotation] {
-			updated.Annotations[boundByControllerAnnotation] = pObj.Annotations[boundByControllerAnnotation]
-		}
-		if updated.Annotations[storageProvisionerAnnotation] != pObj.Annotations[storageProvisionerAnnotation] {
-			updated.Annotations[storageProvisionerAnnotation] = pObj.Annotations[storageProvisionerAnnotation]
-		}
+		vObj.Annotations[storageProvisionerAnnotation] = pObj.Annotations[storageProvisionerAnnotation]
 	}
-
-	return updated
-}
-
-func translateUpdateNeeded(pAnnotations, vAnnotations map[string]string) bool {
-	if pAnnotations == nil {
-		pAnnotations = map[string]string{}
-	}
-	if vAnnotations == nil {
-		vAnnotations = map[string]string{}
-	}
-
-	return vAnnotations[bindCompletedAnnotation] != pAnnotations[bindCompletedAnnotation] ||
-		vAnnotations[boundByControllerAnnotation] != pAnnotations[boundByControllerAnnotation] ||
-		vAnnotations[storageProvisionerAnnotation] != pAnnotations[storageProvisionerAnnotation]
-}
-
-func newIfNil(updated *corev1.PersistentVolumeClaim, pObj *corev1.PersistentVolumeClaim) *corev1.PersistentVolumeClaim {
-	if updated == nil {
-		return pObj.DeepCopy()
-	}
-	return updated
 }

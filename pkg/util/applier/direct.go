@@ -7,11 +7,13 @@ Originally sourced from https://github.com/kubernetes-sigs/kubebuilder-declarati
 import (
 	"context"
 	"fmt"
-	"github.com/spf13/cobra"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/tools/clientcmd"
 	"os"
 	"strings"
+
+	"github.com/spf13/cobra"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/clientcmd"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
@@ -33,7 +35,7 @@ func NewDirectApplier() *DirectApplier {
 	return &DirectApplier{}
 }
 
-func (d *DirectApplier) Apply(ctx context.Context, opt ApplierOptions) error {
+func (d *DirectApplier) Apply(_ context.Context, opt Options) error {
 	ioStreams := genericclioptions.IOStreams{
 		In:     os.Stdin,
 		Out:    os.Stdout,
@@ -46,12 +48,9 @@ func (d *DirectApplier) Apply(ctx context.Context, opt ApplierOptions) error {
 		RESTConfig: opt.RESTConfig,
 	}
 
-	f := cmdutil.NewFactory(restClientGetter)
-	res := resource.NewBuilder(restClientGetter).Unstructured().Stream(ioReader, "manifestString").Do()
-	infos, err := res.Infos()
-	if err != nil {
-		return err
-	}
+	factory := cmdutil.NewFactory(restClientGetter)
+	res := resource.NewBuilder(restClientGetter).Unstructured().Stream(ioReader, "manifests").Do()
+	infos, resErr := res.Infos()
 
 	// Populate the namespace on any namespace-scoped objects
 	if opt.Namespace != "" {
@@ -63,9 +62,9 @@ func (d *DirectApplier) Apply(ctx context.Context, opt ApplierOptions) error {
 		}
 	}
 
-	flags := apply.NewApplyFlags(f, ioStreams)
+	flags := apply.NewApplyFlags(ioStreams)
 	flags.AddFlags(&cobra.Command{})
-	applyOpts, err := newOptions(flags, opt.Namespace)
+	applyOpts, err := newOptions(factory, flags, opt.Namespace)
 	if err != nil {
 		return err
 	}
@@ -75,17 +74,21 @@ func (d *DirectApplier) Apply(ctx context.Context, opt ApplierOptions) error {
 		IOStreams: ioStreams,
 	}
 
-	return applyOpts.Run()
+	err = applyOpts.Run()
+	if err != nil {
+		return err
+	}
+
+	return resErr
 }
 
-func newOptions(flags *apply.ApplyFlags, namespace string) (*apply.ApplyOptions, error) {
-	dynamicClient, err := flags.Factory.DynamicClient()
+func newOptions(factory cmdutil.Factory, flags *apply.ApplyFlags, namespace string) (*apply.ApplyOptions, error) {
+	dynamicClient, err := factory.DynamicClient()
 	if err != nil {
 		return nil, err
 	}
 
 	// allow for a success message operation to be specified at print time
-	dryRunVerifier := resource.NewDryRunVerifier(dynamicClient, flags.Factory.OpenAPIGetter())
 	toPrinter := func(operation string) (printers.ResourcePrinter, error) {
 		flags.PrintFlags.NamePrintFlags.Operation = operation
 		cmdutil.PrintFlagsWithDryRunStrategy(flags.PrintFlags, cmdutil.DryRunNone)
@@ -98,8 +101,8 @@ func newOptions(flags *apply.ApplyFlags, namespace string) (*apply.ApplyOptions,
 		IOStreams:     flags.IOStreams,
 	}
 
-	builder := flags.Factory.NewBuilder()
-	mapper, err := flags.Factory.ToRESTMapper()
+	builder := factory.NewBuilder()
+	mapper, err := factory.ToRESTMapper()
 	if err != nil {
 		return nil, err
 	}
@@ -114,13 +117,11 @@ func newOptions(flags *apply.ApplyFlags, namespace string) (*apply.ApplyOptions,
 		FieldManager:    "vcluster",
 		Selector:        "",
 		DryRunStrategy:  cmdutil.DryRunNone,
-		DryRunVerifier:  dryRunVerifier,
 		Prune:           false,
 		PruneResources:  nil,
 		All:             flags.All,
 		Overwrite:       flags.Overwrite,
 		OpenAPIPatch:    flags.OpenAPIPatch,
-		PruneWhitelist:  flags.PruneWhitelist,
 
 		Recorder:         recorder,
 		Namespace:        namespace,
@@ -130,8 +131,8 @@ func newOptions(flags *apply.ApplyFlags, namespace string) (*apply.ApplyOptions,
 		DynamicClient:    dynamicClient,
 
 		IOStreams:         flags.IOStreams,
-		VisitedUids:       sets.NewString(),
-		VisitedNamespaces: sets.NewString(),
+		VisitedUids:       sets.New[types.UID](),
+		VisitedNamespaces: sets.New[string](),
 	}
 
 	o.PostProcessorFn = o.PrintAndPrunePostProcessor()

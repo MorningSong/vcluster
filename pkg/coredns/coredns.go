@@ -2,9 +2,11 @@ package coredns
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path"
+	"strings"
 	"text/template"
 
 	"github.com/loft-sh/vcluster/pkg/constants"
@@ -14,28 +16,22 @@ import (
 )
 
 const (
-	DefaultImage          = "coredns/coredns"
+	DefaultImage          = "coredns/coredns:1.11.3"
 	ManifestRelativePath  = "coredns/coredns.yaml"
 	ManifestsOutputFolder = "/tmp/manifests-to-apply"
 	VarImage              = "IMAGE"
+	VarHostDNS            = "HOST_CLUSTER_DNS"
 	VarRunAsUser          = "RUN_AS_USER"
 	VarRunAsNonRoot       = "RUN_AS_NON_ROOT"
+	VarRunAsGroup         = "RUN_AS_GROUP"
 	VarLogInDebug         = "LOG_IN_DEBUG"
-	UID                   = int64(1001)
+	defaultUID            = int64(1001)
+	defaultGID            = int64(1001)
 )
 
-var CoreDNSVersionMap = map[string]string{
-	"1.23": "coredns/coredns:1.8.6",
-	"1.22": "coredns/coredns:1.8.4",
-	"1.21": "coredns/coredns:1.8.3",
-	"1.20": "coredns/coredns:1.8.0",
-	"1.19": "coredns/coredns:1.6.9",
-	"1.18": "coredns/coredns:1.6.9",
-	"1.17": "coredns/coredns:1.6.9",
-	"1.16": "coredns/coredns:1.6.3",
-}
+var ErrNoCoreDNSManifests = fmt.Errorf("no coredns manifests found")
 
-func ApplyManifest(defaultImageRegistry string, inClusterConfig *rest.Config, serverVersion *version.Info) error {
+func ApplyManifest(ctx context.Context, defaultImageRegistry string, inClusterConfig *rest.Config, serverVersion *version.Info) error {
 	vars := getManifestVariables(defaultImageRegistry, serverVersion)
 	output, err := processManifestTemplate(vars)
 	if err != nil {
@@ -54,7 +50,7 @@ func ApplyManifest(defaultImageRegistry string, inClusterConfig *rest.Config, se
 		_, _ = debugOutputFile.Write(output)
 	}
 
-	return applier.ApplyManifest(inClusterConfig, output)
+	return applier.ApplyManifest(ctx, inClusterConfig, output)
 }
 
 func prepareManifestOutput() (*os.File, error) {
@@ -69,19 +65,47 @@ func prepareManifestOutput() (*os.File, error) {
 func getManifestVariables(defaultImageRegistry string, serverVersion *version.Info) map[string]interface{} {
 	var found bool
 	vars := make(map[string]interface{})
-	vars[VarImage], found = CoreDNSVersionMap[fmt.Sprintf("%s.%s", serverVersion.Major, serverVersion.Minor)]
+	vars[VarImage], found = constants.CoreDNSVersionMap[fmt.Sprintf("%s.%s", serverVersion.Major, serverVersion.Minor)]
 	if !found {
 		vars[VarImage] = DefaultImage
 	}
-	vars[VarImage] = defaultImageRegistry + vars[VarImage].(string)
+	if defaultImageRegistry != "" {
+		vars[VarImage] = strings.TrimSuffix(defaultImageRegistry, "/") + "/" + vars[VarImage].(string)
+	}
 	vars[VarRunAsUser] = fmt.Sprintf("%v", GetUserID())
-	vars[VarRunAsNonRoot] = "true"
+	vars[VarRunAsGroup] = fmt.Sprintf("%v", GetGroupID())
 	if os.Getenv("DEBUG") == "true" {
 		vars[VarLogInDebug] = "log"
 	} else {
 		vars[VarLogInDebug] = ""
 	}
+	vars[VarHostDNS] = getNameserver()
 	return vars
+}
+
+func getNameserver() string {
+	raw, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		return "/etc/resolv.conf"
+	}
+
+	nameservers := GetNameservers(raw)
+	if len(nameservers) == 0 {
+		return "/etc/resolv.conf"
+	}
+
+	return nameservers[0]
+}
+
+// GetGroupID retrieves the current group id and if the current process is running
+// as root we fallback to GID 1001
+func GetGroupID() int64 {
+	gid := os.Getgid()
+	if gid == 0 {
+		return defaultGID
+	}
+
+	return int64(gid)
 }
 
 // GetUserID retrieves the current user id and if the current process is running
@@ -89,22 +113,26 @@ func getManifestVariables(defaultImageRegistry string, serverVersion *version.In
 func GetUserID() int64 {
 	uid := os.Getuid()
 	if uid == 0 {
-		return UID
+		return defaultUID
 	}
 
 	return int64(uid)
 }
 
 func processManifestTemplate(vars map[string]interface{}) ([]byte, error) {
-	manifestInputPath := path.Join(constants.ContainerManifestsFolder, ManifestRelativePath)
+	manifestInputPath := path.Join("/manifests", ManifestRelativePath)
+	// check if the manifestInputPath exists
+	if _, err := os.Stat(manifestInputPath); os.IsNotExist(err) {
+		return nil, ErrNoCoreDNSManifests
+	}
 	manifestTemplate, err := template.ParseFiles(manifestInputPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to parse %s: %v", manifestInputPath, err)
+		return nil, fmt.Errorf("unable to parse %s: %w", manifestInputPath, err)
 	}
 	buf := new(bytes.Buffer)
 	err = manifestTemplate.Execute(buf, vars)
 	if err != nil {
-		return nil, fmt.Errorf("manifestTemplate.Execute failed for manifest %s: %v", manifestInputPath, err)
+		return nil, fmt.Errorf("manifestTemplate.Execute failed for manifest %s: %w", manifestInputPath, err)
 	}
 	return buf.Bytes(), nil
 }

@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -286,7 +287,7 @@ func GetControlPlaneEndpoint(controlPlaneEndpoint string, localEndpoint *APIEndp
 		localEndpointPort := strconv.Itoa(int(localEndpoint.BindPort))
 		if port != "" {
 			if port != localEndpointPort {
-				fmt.Println("[endpoint] WARNING: port specified in controlPlaneEndpoint overrides bindPort in the controlplane address")
+				klog.Infof("[endpoint] WARNING: port specified in controlPlaneEndpoint overrides bindPort in the controlplane address")
 			}
 		} else {
 			port = localEndpointPort
@@ -309,7 +310,7 @@ func parseAPIEndpoint(localEndpoint *APIEndpoint) (net.IP, string, error) {
 	}
 
 	// parse the AdvertiseAddress
-	var ip = net.ParseIP(localEndpoint.AdvertiseAddress)
+	ip := net.ParseIP(localEndpoint.AdvertiseAddress)
 	if ip == nil {
 		return nil, "", errors.Errorf("invalid value `%s` given for api.advertiseAddress", localEndpoint.AdvertiseAddress)
 	}
@@ -510,8 +511,8 @@ func appendSANsToAltNames(altNames *certutil.AltNames, SANs []string, certName s
 		} else if len(validation.IsWildcardDNS1123Subdomain(altname)) == 0 {
 			altNames.DNSNames = append(altNames.DNSNames, altname)
 		} else {
-			fmt.Printf(
-				"[certificates] WARNING: '%s' was not added to the '%s' SAN, because it is not a valid IP or RFC-1123 compliant DNS entry\n",
+			klog.Infof(
+				"[certificates] WARNING: '%s' was not added to the '%s' SAN, because it is not a valid IP or RFC-1123 compliant DNS entry",
 				altname,
 				certName,
 			)
@@ -554,6 +555,10 @@ func GeneratePrivateKey(keyType x509.PublicKeyAlgorithm) (crypto.Signer, error) 
 
 // NewSignedCert creates a signed certificate using the given CA certificate and key
 func NewSignedCert(cfg *CertConfig, key crypto.Signer, caCert *x509.Certificate, caKey crypto.Signer, isCA bool) (*x509.Certificate, error) {
+	if key == nil {
+		return nil, errors.New("missing private key")
+	}
+
 	serial, err := cryptorand.Int(cryptorand.Reader, new(big.Int).SetInt64(math.MaxInt64))
 	if err != nil {
 		return nil, err

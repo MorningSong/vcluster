@@ -43,23 +43,22 @@ const (
 	syncNothing
 )
 
-// AggregationController periodically check for changes in OpenAPI specs of APIServices and update/remove
-// them if necessary.
+// AggregationController periodically checks the list of group-versions handled by each APIService and updates the discovery page periodically
 type AggregationController struct {
-	openAPIAggregationManager aggregator.SpecAggregator
-	queue                     workqueue.RateLimitingInterface
+	openAPIAggregationManager aggregator.SpecProxier
+	queue                     workqueue.TypedRateLimitingInterface[string]
 
 	// To allow injection for testing.
 	syncHandler func(key string) (syncAction, error)
 }
 
 // NewAggregationController creates new OpenAPI aggregation controller.
-func NewAggregationController(openAPIAggregationManager aggregator.SpecAggregator) *AggregationController {
+func NewAggregationController(openAPIAggregationManager aggregator.SpecProxier) *AggregationController {
 	c := &AggregationController{
 		openAPIAggregationManager: openAPIAggregationManager,
-		queue: workqueue.NewNamedRateLimitingQueue(
-			workqueue.NewItemExponentialFailureRateLimiter(successfulUpdateDelay, failedUpdateMaxExpDelay),
-			"open_api_v3_aggregation_controller",
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			workqueue.NewTypedItemExponentialFailureRateLimiter[string](successfulUpdateDelay, failedUpdateMaxExpDelay),
+			workqueue.TypedRateLimitingQueueConfig[string]{Name: "open_api_v3_aggregation_controller"},
 		),
 	}
 
@@ -99,7 +98,7 @@ func (c *AggregationController) processNextWorkItem() bool {
 		return false
 	}
 
-	if aggregator.IsLocalAPIService(key.(string)) {
+	if aggregator.IsLocalAPIService(key) {
 		// for local delegation targets that are aggregated once per second, log at
 		// higher level to avoid flooding the log
 		klog.V(6).Infof("OpenAPI AggregationController: Processing item %s", key)
@@ -107,7 +106,7 @@ func (c *AggregationController) processNextWorkItem() bool {
 		klog.V(4).Infof("OpenAPI AggregationController: Processing item %s", key)
 	}
 
-	action, err := c.syncHandler(key.(string))
+	action, err := c.syncHandler(key)
 	if err == nil {
 		c.queue.Forget(key)
 	} else {
@@ -116,7 +115,7 @@ func (c *AggregationController) processNextWorkItem() bool {
 
 	switch action {
 	case syncRequeue:
-		if aggregator.IsLocalAPIService(key.(string)) {
+		if aggregator.IsLocalAPIService(key) {
 			klog.V(7).Infof("OpenAPI AggregationController: action for local item %s: Requeue after %s.", key, successfulUpdateDelayLocal)
 			c.queue.AddAfter(key, successfulUpdateDelayLocal)
 		} else {
@@ -134,9 +133,10 @@ func (c *AggregationController) processNextWorkItem() bool {
 }
 
 func (c *AggregationController) sync(key string) (syncAction, error) {
-	err := c.openAPIAggregationManager.UpdateAPIServiceSpec(key)
-	switch {
-	case err != nil:
+	if err := c.openAPIAggregationManager.UpdateAPIServiceSpec(key); err != nil {
+		if err == aggregator.ErrAPIServiceNotFound {
+			return syncNothing, nil
+		}
 		return syncRequeueRateLimited, err
 	}
 	return syncRequeue, nil

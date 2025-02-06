@@ -1,14 +1,16 @@
 /*
-	Copyright The Helm Authors.
-	Licensed under the Apache License, Version 2.0 (the "License");
-	you may not use this file except in compliance with the License.
-	You may obtain a copy of the License at
-		http://www.apache.org/licenses/LICENSE-2.0
-	Unless required by applicable law or agreed to in writing, software
-	distributed under the License is distributed on an "AS IS" BASIS,
-	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-	See the License for the specific language governing permissions and
-	limitations under the License.
+Copyright The Helm Authors.
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 */
 package helm
 
@@ -19,14 +21,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	v1 "k8s.io/api/core/v1"
+	"io"
+	"sort"
+
+	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kblabels "k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 )
 
 var b64 = base64.StdEncoding
@@ -50,7 +54,7 @@ type Release struct {
 	// Namespace is the kubernetes namespace of the release.
 	Namespace string `json:"namespace,omitempty"`
 
-	Secret *v1.Secret `json:"-"`
+	Secret *corev1.Secret `json:"-"`
 }
 
 // Info describes release information.
@@ -146,7 +150,9 @@ type Metadata struct {
 
 // Chart holds the chart metadata
 type Chart struct {
-	Metadata *Metadata `json:"metadata,omitempty"`
+	Metadata *Metadata              `json:"metadata,omitempty"`
+	Values   map[string]interface{} `json:"values,omitempty"`
+	Schema   string                 `json:"schema,omitempty"`
 }
 
 // Secrets is a wrapper around an implementation of a kubernetes
@@ -163,8 +169,50 @@ func NewSecrets(clientSet kubernetes.Interface) *Secrets {
 	}
 }
 
-func (secrets *Secrets) Update(ctx context.Context, secret *v1.Secret) (*v1.Secret, error) {
+func (secrets *Secrets) Update(ctx context.Context, secret *corev1.Secret) (*corev1.Secret, error) {
 	return secrets.kubeClient.CoreV1().Secrets(secret.Namespace).Update(ctx, secret, metav1.UpdateOptions{})
+}
+
+// ListUnfiltered fetches all releases and returns the list releases such
+// that filter(release) == true. An error is returned if the
+// secret fails to retrieve the releases.
+func (secrets *Secrets) ListUnfiltered(ctx context.Context, labels kblabels.Selector, namespace string) ([]*Release, error) {
+	req, err := kblabels.NewRequirement("owner", selection.Equals, []string{"helm"})
+	if err != nil {
+		return nil, err
+	}
+	if labels == nil {
+		labels = kblabels.Everything()
+	}
+	labels = labels.Add(*req)
+	list, err := secrets.kubeClient.CoreV1().Secrets(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// iterate over the secrets object list
+	// and decode each release
+	var releases []*Release
+	for _, item := range list.Items {
+		cpy := item
+		release, err := decodeRelease(&cpy, string(item.Data["release"]))
+		if err != nil {
+			klog.FromContext(ctx).Error(err, "list: failed to decode release")
+			continue
+		} else if release.Chart == nil || release.Chart.Metadata == nil || release.Info == nil {
+			klog.FromContext(ctx).Info("list: metadata info is empty for release", "name", release.Name)
+			continue
+		}
+
+		releases = append(releases, release)
+	}
+
+	sort.Slice(releases, func(i, j int) bool {
+		return releases[i].Version < releases[j].Version
+	})
+	return releases, nil
 }
 
 // List fetches all releases and returns the list releases such
@@ -202,7 +250,7 @@ func (secrets *Secrets) List(ctx context.Context, labels kblabels.Selector, name
 			continue
 		}
 
-		// check if this release superseeds an already existing release
+		// check if this release supersedes an already existing release
 		found := false
 		for i, r := range results {
 			if r.Name == rls.Name && r.Namespace == rls.Namespace && r.Version < rls.Version {
@@ -218,7 +266,7 @@ func (secrets *Secrets) List(ctx context.Context, labels kblabels.Selector, name
 	return results, nil
 }
 
-// Query fetches all releases that match the provided map of labels.
+// Get Query fetches all releases that match the provided map of labels.
 // An error is returned if the secret fails to retrieve the releases.
 func (secrets *Secrets) Get(ctx context.Context, name string, namespace string) (*Release, error) {
 	ls := kblabels.Set{}
@@ -227,7 +275,7 @@ func (secrets *Secrets) Get(ctx context.Context, name string, namespace string) 
 	if err != nil {
 		return nil, err
 	} else if len(list) == 0 {
-		return nil, kerrors.NewNotFound(v1.SchemeGroupVersion.WithResource("secrets").GroupResource(), name)
+		return nil, kerrors.NewNotFound(corev1.SchemeGroupVersion.WithResource("secrets").GroupResource(), name)
 	}
 
 	var latest *Release
@@ -243,7 +291,7 @@ func (secrets *Secrets) Get(ctx context.Context, name string, namespace string) 
 // decodeRelease decodes the bytes of data into a release
 // type. Data must contain a base64 encoded gzipped string of a
 // valid release, otherwise an error is returned.
-func decodeRelease(secret *v1.Secret, data string) (*Release, error) {
+func decodeRelease(secret *corev1.Secret, data string) (*Release, error) {
 	// base64 decode string
 	b, err := b64.DecodeString(data)
 	if err != nil {
@@ -260,7 +308,7 @@ func decodeRelease(secret *v1.Secret, data string) (*Release, error) {
 		if err != nil {
 			return nil, err
 		}
-		b2, err := ioutil.ReadAll(r)
+		b2, err := io.ReadAll(r)
 		if err != nil {
 			return nil, err
 		}
@@ -270,7 +318,7 @@ func decodeRelease(secret *v1.Secret, data string) (*Release, error) {
 	var rls Release
 	// unmarshal release object bytes
 	if err := json.Unmarshal(b, &rls); err != nil {
-		return nil, fmt.Errorf("error decoding %s: %v", string(b), err)
+		return nil, fmt.Errorf("error decoding %s: %w", string(b), err)
 	}
 
 	rls.Secret = secret

@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/x509"
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -71,7 +70,7 @@ func CreateJoinControlPlaneKubeConfigFiles(outDir string, cfg *InitConfiguration
 
 	for _, file := range files {
 		if externaCA {
-			fmt.Printf("[kubeconfig] External CA mode: Using user provided %s\n", file)
+			klog.Infof("[kubeconfig] External CA mode: Using user provided %s", file)
 			continue
 		}
 		if err := createKubeConfigFiles(outDir, cfg, file); err != nil {
@@ -84,7 +83,6 @@ func CreateJoinControlPlaneKubeConfigFiles(outDir string, cfg *InitConfiguration
 // createKubeConfigFiles creates all the requested kubeconfig files.
 // If kubeconfig files already exists, they are used only if evaluated equal; otherwise an error is returned.
 func createKubeConfigFiles(outDir string, cfg *InitConfiguration, kubeConfigFileNames ...string) error {
-
 	// gets the KubeConfigSpecs, actualized for the current InitConfiguration
 	specs, err := getKubeConfigSpecs(cfg)
 	if err != nil {
@@ -136,7 +134,6 @@ func getKubeConfigSpecs(cfg *InitConfiguration) (map[string]*kubeConfigSpec, err
 
 // buildKubeConfigFromSpec creates a kubeconfig object for the given kubeConfigSpec
 func buildKubeConfigFromSpec(spec *kubeConfigSpec, clustername string, notAfter *time.Time) (*clientcmdapi.Config, error) {
-
 	// If this kubeconfig should use token
 	if spec.TokenAuth != nil {
 		// create a kubeconfig with a token
@@ -185,6 +182,13 @@ func newClientCertConfigFromKubeConfigSpec(spec *kubeConfigSpec, notAfter *time.
 
 // validateKubeConfig check if the kubeconfig file exist and has the expected CA and server URL
 func validateKubeConfig(outDir, filename string, config *clientcmdapi.Config) error {
+	if config == nil {
+		return errors.New("nil config")
+	}
+	if config.Contexts == nil || config.Clusters == nil {
+		return errors.New("config contains unexpected nil fields")
+	}
+
 	kubeConfigFilePath := filepath.Join(outDir, filename)
 
 	if _, err := os.Stat(kubeConfigFilePath); err != nil {
@@ -214,8 +218,18 @@ func validateKubeConfig(outDir, filename string, config *clientcmdapi.Config) er
 	// Make sure the compared CAs are whitespace-trimmed. The function clientcmd.LoadFromFile() just decodes
 	// the base64 CA and places it raw in the v1.Config object. In case the user has extra whitespace
 	// in the CA they used to create a kubeconfig this comparison to a generated v1.Config will otherwise fail.
-	caCurrent := bytes.TrimSpace(currentConfig.Clusters[currentCluster].CertificateAuthorityData)
-	caExpected := bytes.TrimSpace(config.Clusters[expectedCluster].CertificateAuthorityData)
+	currentConfigCurrentCluster, ok := currentConfig.Clusters[currentCluster]
+	if !ok {
+		return errors.New("current cluster not found in current configs")
+	}
+
+	configExpectedCluster, ok := config.Clusters[expectedCluster]
+	if !ok {
+		return errors.New("expected cluster not found")
+	}
+
+	caCurrent := bytes.TrimSpace(currentConfigCurrentCluster.CertificateAuthorityData)
+	caExpected := bytes.TrimSpace(configExpectedCluster.CertificateAuthorityData)
 
 	// If the current CA cert on disk doesn't match the expected CA cert, error out because we have a file, but it's stale
 	if !bytes.Equal(caCurrent, caExpected) {
@@ -243,7 +257,7 @@ func createKubeConfigFileIfNotExists(outDir, filename string, config *clientcmda
 		if !os.IsNotExist(err) {
 			return err
 		}
-		fmt.Printf("[kubeconfig] Writing %q kubeconfig file\n", filename)
+		klog.Infof("[kubeconfig] Writing %q kubeconfig file", filename)
 		err = WriteToDisk(kubeConfigFilePath, config)
 		if err != nil {
 			return errors.Wrapf(err, "failed to save kubeconfig file %q on disk", kubeConfigFilePath)
@@ -253,7 +267,7 @@ func createKubeConfigFileIfNotExists(outDir, filename string, config *clientcmda
 	// kubeadm doesn't validate the existing kubeconfig file more than this (kubeadm trusts the client certs to be valid)
 	// Basically, if we find a kubeconfig file with the same path; the same CA cert and the same server URL;
 	// kubeadm thinks those files are equal and doesn't bother writing a new file
-	fmt.Printf("[kubeconfig] Using existing kubeconfig file: %q\n", kubeConfigFilePath)
+	klog.Infof("[kubeconfig] Using existing kubeconfig file: %q", kubeConfigFilePath)
 
 	return nil
 }

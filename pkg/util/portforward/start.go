@@ -3,28 +3,29 @@ package portforward
 import (
 	"context"
 	"fmt"
-	"github.com/loft-sh/vcluster/cmd/vclusterctl/log"
 	"io"
+	"net/http"
+	"time"
+
+	"github.com/loft-sh/log"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport/spdy"
-	"net/http"
-	"time"
 )
 
-func StartPortForwardingWithRestart(config *rest.Config, address, pod, namespace string, localPort, remotePort string, interrupt chan struct{}, stdout io.Writer, stderr io.Writer, log log.Logger) error {
+func StartPortForwardingWithRestart(ctx context.Context, config *rest.Config, address, pod, namespace string, localPort, remotePort string, interrupt chan struct{}, stdout io.Writer, stderr io.Writer, log log.Logger) error {
 	kubeClient, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return err
 	}
 
 	// restart port forwarding
-	stopChan, err := StartPortForwarding(config, kubeClient, address, pod, namespace, localPort, remotePort, stdout, stderr, log)
+	stopChan, err := StartPortForwarding(ctx, config, kubeClient, address, pod, namespace, localPort, remotePort, stdout, stderr, log)
 	if err != nil {
-		return fmt.Errorf("error starting port forwarding: %v", err)
+		return fmt.Errorf("error starting port forwarding: %w", err)
 	}
 
 	for {
@@ -36,8 +37,8 @@ func StartPortForwardingWithRestart(config *rest.Config, address, pod, namespace
 			log.Info("Restarting port forwarding")
 
 			// wait for loft pod to start
-			err := wait.PollImmediate(time.Second, time.Minute*10, func() (done bool, err error) {
-				pod, err := kubeClient.CoreV1().Pods(namespace).Get(context.Background(), pod, metav1.GetOptions{})
+			err := wait.PollUntilContextTimeout(ctx, time.Second, time.Minute*10, true, func(ctx context.Context) (done bool, err error) {
+				pod, err := kubeClient.CoreV1().Pods(namespace).Get(ctx, pod, metav1.GetOptions{})
 				if err != nil {
 					return false, nil
 				}
@@ -54,7 +55,7 @@ func StartPortForwardingWithRestart(config *rest.Config, address, pod, namespace
 			}
 
 			// restart port forwarding
-			stopChan, err = StartPortForwarding(config, kubeClient, address, pod, namespace, localPort, remotePort, stdout, stderr, log)
+			stopChan, err = StartPortForwarding(ctx, config, kubeClient, address, pod, namespace, localPort, remotePort, stdout, stderr, log)
 			if err != nil {
 				log.Warnf("error starting port forwarding: %v", err)
 				continue
@@ -65,7 +66,7 @@ func StartPortForwardingWithRestart(config *rest.Config, address, pod, namespace
 	}
 }
 
-func StartPortForwarding(config *rest.Config, client kubernetes.Interface, address, pod, namespace, localPort, remotePort string, stdout io.Writer, stderr io.Writer, log log.Logger) (chan struct{}, error) {
+func StartPortForwarding(ctx context.Context, config *rest.Config, client kubernetes.Interface, address, pod, namespace, localPort, remotePort string, stdout io.Writer, stderr io.Writer, log log.Logger) (chan struct{}, error) {
 	execRequest := client.CoreV1().RESTClient().Post().
 		Resource("pods").
 		Name(pod).
@@ -91,7 +92,7 @@ func StartPortForwarding(config *rest.Config, client kubernetes.Interface, addre
 	}
 
 	go func() {
-		err := forwarder.ForwardPorts()
+		err := forwarder.ForwardPorts(ctx)
 		if err != nil {
 			errChan <- err
 		}

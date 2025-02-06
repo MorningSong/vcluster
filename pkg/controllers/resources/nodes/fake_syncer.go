@@ -3,13 +3,18 @@ package nodes
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"strings"
+
+	"github.com/loft-sh/vcluster/pkg/constants"
+	"github.com/loft-sh/vcluster/pkg/syncer/synccontext"
+	syncer "github.com/loft-sh/vcluster/pkg/syncer/types"
+	"k8s.io/apimachinery/pkg/api/equality"
 
 	"github.com/loft-sh/vcluster/pkg/controllers/resources/nodes/nodeservice"
-	"github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
-	"github.com/loft-sh/vcluster/pkg/controllers/syncer"
-	synccontext "github.com/loft-sh/vcluster/pkg/controllers/syncer/context"
+	podtranslate "github.com/loft-sh/vcluster/pkg/controllers/resources/pods/translate"
 	"github.com/loft-sh/vcluster/pkg/util/random"
-	"github.com/pkg/errors"
+	"github.com/loft-sh/vcluster/pkg/util/translate"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,14 +29,18 @@ var (
 	FakeNodesVersion = "v1.19.1"
 )
 
-func NewFakeSyncer(ctx *synccontext.RegisterContext, nodeService nodeservice.NodeServiceProvider) (syncer.Object, error) {
+func NewFakeSyncer(ctx *synccontext.RegisterContext, nodeService nodeservice.Provider) (syncer.Object, error) {
 	return &fakeNodeSyncer{
-		nodeServiceProvider: nodeService,
+		nodeServiceProvider:  nodeService,
+		fakeKubeletIPs:       ctx.Config.Networking.Advanced.ProxyKubelets.ByIP,
+		fakeKubeletHostnames: ctx.Config.Networking.Advanced.ProxyKubelets.ByHostname,
 	}, nil
 }
 
 type fakeNodeSyncer struct {
-	nodeServiceProvider nodeservice.NodeServiceProvider
+	nodeServiceProvider  nodeservice.Provider
+	fakeKubeletIPs       bool
+	fakeKubeletHostnames bool
 }
 
 func (r *fakeNodeSyncer) Resource() client.Object {
@@ -56,7 +65,7 @@ func (r *fakeNodeSyncer) ModifyController(ctx *synccontext.RegisterContext, buil
 
 var _ syncer.FakeSyncer = &fakeNodeSyncer{}
 
-func (r *fakeNodeSyncer) FakeSyncUp(ctx *synccontext.SyncContext, name types.NamespacedName) (ctrl.Result, error) {
+func (r *fakeNodeSyncer) FakeSyncToVirtual(ctx *synccontext.SyncContext, name types.NamespacedName) (ctrl.Result, error) {
 	needed, err := r.nodeNeeded(ctx, name.Name)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -65,7 +74,7 @@ func (r *fakeNodeSyncer) FakeSyncUp(ctx *synccontext.SyncContext, name types.Nam
 	}
 
 	ctx.Log.Infof("Create fake node %s", name.Name)
-	return ctrl.Result{}, CreateFakeNode(ctx.Context, r.nodeServiceProvider, ctx.VirtualClient, name)
+	return ctrl.Result{}, createFakeNode(ctx, r.fakeKubeletIPs, r.fakeKubeletHostnames, r.nodeServiceProvider, ctx.VirtualClient, name.Name)
 }
 
 func (r *fakeNodeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj client.Object) (ctrl.Result, error) {
@@ -77,36 +86,83 @@ func (r *fakeNodeSyncer) FakeSync(ctx *synccontext.SyncContext, vObj client.Obje
 	needed, err := r.nodeNeeded(ctx, node.Name)
 	if err != nil {
 		return ctrl.Result{}, err
-	} else if needed {
-		return ctrl.Result{}, nil
+	} else if !needed {
+		ctx.Log.Infof("Delete fake node %s as it is not needed anymore", vObj.GetName())
+		return ctrl.Result{}, ctx.VirtualClient.Delete(ctx, vObj)
 	}
 
-	ctx.Log.Infof("Delete fake node %s as it is not needed anymore", vObj.GetName())
-	return ctrl.Result{}, ctx.VirtualClient.Delete(ctx.Context, vObj)
+	// check if we need to update node ips
+	updated := r.updateIfNeeded(ctx, node, node.Name)
+	if updated != nil {
+		ctx.Log.Infof("Update fake node %s", node.Name)
+		err := ctx.VirtualClient.Status().Update(ctx, updated)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("update node: %w", err)
+		}
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *fakeNodeSyncer) updateIfNeeded(ctx *synccontext.SyncContext, node *corev1.Node, name string) *corev1.Node {
+	var updated *corev1.Node
+
+	newAddresses := []corev1.NodeAddress{
+		{
+			Address: GetNodeHost(node.Name),
+			Type:    corev1.NodeHostName,
+		},
+	}
+
+	if r.fakeKubeletIPs {
+		nodeIP, err := r.nodeServiceProvider.GetNodeIP(ctx, name)
+		if err != nil {
+			ctx.Log.Errorf("error getting fake node ip: %v", err)
+		}
+
+		newAddresses = append(newAddresses, corev1.NodeAddress{
+			Address: nodeIP,
+			Type:    corev1.NodeInternalIP,
+		})
+	}
+
+	if !equality.Semantic.DeepEqual(node.Status.Addresses, newAddresses) {
+		updated = node.DeepCopy()
+		updated.Status.Addresses = newAddresses
+	}
+
+	return updated
 }
 
 func (r *fakeNodeSyncer) nodeNeeded(ctx *synccontext.SyncContext, nodeName string) (bool, error) {
-	return isNodeNeededByPod(ctx.Context, ctx.VirtualClient, ctx.PhysicalClient, nodeName)
+	return isNodeNeededByPod(ctx, ctx.VirtualClient, ctx.PhysicalClient, nodeName)
 }
 
 // this is not a real guid, but it doesn't really matter because it should just look right and not be an actual guid
 func newGUID() string {
-	return random.RandomString(8) + "-" + random.RandomString(4) + "-" + random.RandomString(4) + "-" + random.RandomString(4) + "-" + random.RandomString(12)
+	return random.String(8) + "-" + random.String(4) + "-" + random.String(4) + "-" + random.String(4) + "-" + random.String(12)
 }
 
-func CreateFakeNode(ctx context.Context, nodeServiceProvider nodeservice.NodeServiceProvider, virtualClient client.Client, name types.NamespacedName) error {
+func createFakeNode(
+	ctx context.Context,
+	fakeKubeletIPs bool,
+	fakeKubeletHostnames bool,
+	nodeServiceProvider nodeservice.Provider,
+	virtualClient client.Client,
+	name string,
+) error {
 	nodeServiceProvider.Lock()
 	defer nodeServiceProvider.Unlock()
 
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name.Name,
+			Name: name,
 			Labels: map[string]string{
 				"vcluster.loft.sh/fake-node": "true",
-				"beta.kubernetes.io/arch":    "amd64",
+				"beta.kubernetes.io/arch":    runtime.GOARCH,
 				"beta.kubernetes.io/os":      "linux",
-				"kubernetes.io/arch":         "amd64",
-				"kubernetes.io/hostname":     "fake-" + name.Name,
+				"kubernetes.io/arch":         runtime.GOARCH,
+				"kubernetes.io/hostname":     translate.SafeConcatName("fake", name),
 				"kubernetes.io/os":           "linux",
 			},
 			Annotations: map[string]string{
@@ -119,11 +175,6 @@ func CreateFakeNode(ctx context.Context, nodeServiceProvider nodeservice.NodeSer
 	err := virtualClient.Create(ctx, node)
 	if err != nil {
 		return err
-	}
-
-	nodeIP, err := nodeServiceProvider.GetNodeIP(ctx, name)
-	if err != nil {
-		return errors.Wrap(err, "create fake node ip")
 	}
 
 	orig := node.DeepCopy()
@@ -178,15 +229,10 @@ func CreateFakeNode(ctx context.Context, nodeServiceProvider nodeservice.NodeSer
 				Type:               corev1.NodeReady,
 			},
 		},
-		Addresses: []corev1.NodeAddress{
-			{
-				Address: nodeIP,
-				Type:    corev1.NodeInternalIP,
-			},
-		},
+		Addresses: []corev1.NodeAddress{},
 		DaemonEndpoints: corev1.NodeDaemonEndpoints{
 			KubeletEndpoint: corev1.DaemonEndpoint{
-				Port: nodeservice.KubeletPort,
+				Port: constants.KubeletPort,
 			},
 		},
 		NodeInfo: corev1.NodeSystemInfo{
@@ -194,7 +240,7 @@ func CreateFakeNode(ctx context.Context, nodeServiceProvider nodeservice.NodeSer
 			BootID:                  newGUID(),
 			ContainerRuntimeVersion: "docker://19.3.12",
 			KernelVersion:           "4.19.76-fakelinux",
-			KubeProxyVersion:        FakeNodesVersion,
+			KubeProxyVersion:        FakeNodesVersion, //nolint:staticcheck //deprecated, but we should continue to use it until the api removes it
 			KubeletVersion:          FakeNodesVersion,
 			MachineID:               newGUID(),
 			SystemUUID:              newGUID(),
@@ -203,6 +249,26 @@ func CreateFakeNode(ctx context.Context, nodeServiceProvider nodeservice.NodeSer
 		},
 		Images: []corev1.ContainerImage{},
 	}
+
+	if fakeKubeletHostnames {
+		node.Status.Addresses = append(node.Status.Addresses, corev1.NodeAddress{
+			Address: GetNodeHost(node.Name),
+			Type:    corev1.NodeHostName,
+		})
+	}
+
+	if fakeKubeletIPs {
+		nodeIP, err := nodeServiceProvider.GetNodeIP(ctx, name)
+		if err != nil {
+			return fmt.Errorf("create fake node ip: %w", err)
+		}
+
+		node.Status.Addresses = append(node.Status.Addresses, corev1.NodeAddress{
+			Address: nodeIP,
+			Type:    corev1.NodeInternalIP,
+		})
+	}
+
 	err = virtualClient.Status().Patch(ctx, node, client.MergeFrom(orig))
 	if err != nil {
 		return err
@@ -248,9 +314,19 @@ func filterOutPhysicalDaemonSets(pl *corev1.PodList) []corev1.Pod {
 	var podsNoDaemonSets []corev1.Pod
 
 	for _, item := range pl.Items {
-		if item.Annotations == nil || item.Annotations[translate.OwnerSetKind] != "DaemonSet" {
+		if item.Annotations == nil || item.Annotations[podtranslate.OwnerSetKind] != "DaemonSet" {
 			podsNoDaemonSets = append(podsNoDaemonSets, item)
 		}
 	}
 	return podsNoDaemonSets
+}
+
+func GetNodeHost(nodeName string) string {
+	return strings.ReplaceAll(nodeName, ".", "-") + "." + constants.NodeSuffix
+}
+
+// GetNodeHostLegacy returns Node hostname in a format used in 0.14.x release.
+// This function is added for backwards compatibility and may be removed in a future release.
+func GetNodeHostLegacy(nodeName, currentNamespace string) string {
+	return strings.ReplaceAll(nodeName, ".", "-") + "." + translate.VClusterName + "." + currentNamespace + "." + constants.NodeSuffix
 }

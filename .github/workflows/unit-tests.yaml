@@ -6,23 +6,42 @@ on:
   pull_request:
     branches:
       - main
-      - v0.5
+      - v*
     paths:
       - "**.go"
-      - "!e2e/**" # exclude changes in e2e tests
+      - "!test/**" # exclude changes in e2e tests
       - ".github/workflows/unit-tests.yaml"
       - "hack/test.sh"
+      - "chart/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  unit-test:
-    name: Execute all tests
-    runs-on: ubuntu-18.04
+  helm-unit-tests:
+    name: Execute all helm tests
+    runs-on: ubuntu-latest
     steps:
-      - name: Set up Go 1.17
-        uses: actions/setup-go@v1
-        with:
-          go-version: 1.17
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Helm Unit Test Plugin
+        run: |
+          helm plugin install https://github.com/helm-unittest/helm-unittest --version v0.4.4
+      - name: Run Helm Unit Tests
+        run: |
+          helm unittest chart
+
+  go-unit-test:
+    name: Execute all go tests
+    runs-on: ubuntu-22.04
+    steps:
       - name: Check out code into the Go module directory
-        uses: actions/checkout@v1
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
       - name: Execute unit tests
         run: ./hack/test.sh
