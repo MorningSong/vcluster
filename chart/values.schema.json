@@ -234,6 +234,10 @@
           "$ref": "#/$defs/ControlPlaneHeadlessService",
           "description": "HeadlessService specifies options for the headless service used for the vCluster StatefulSet."
         },
+        "konnectivity": {
+          "$ref": "#/$defs/Konnectivity",
+          "description": "Konnectivity holds dedicated konnectivity configuration. This is only available when privateNodes.enabled is true."
+        },
         "globalMetadata": {
           "$ref": "#/$defs/ControlPlaneGlobalMetadata",
           "description": "GlobalMetadata is metadata that will be added to all resources deployed by Helm."
@@ -675,6 +679,10 @@
           "description": "Embedded defines if vCluster will start the embedded coredns service within the control-plane and not as a separate deployment. This is a PRO feature.",
           "pro": true
         },
+        "security": {
+          "$ref": "#/$defs/ControlPlaneSecurity",
+          "description": "Security defines pod or container security context."
+        },
         "service": {
           "$ref": "#/$defs/CoreDNSService",
           "description": "Service holds extra options for the coredns service deployed within the virtual cluster"
@@ -861,11 +869,7 @@
         },
         "k3s": {
           "$ref": "#/$defs/DistroK3s",
-          "description": "K3S holds K3s relevant configuration."
-        },
-        "k0s": {
-          "$ref": "#/$defs/DistroK0s",
-          "description": "K0S holds k0s relevant configuration."
+          "description": "[Deprecated] K3S holds K3s relevant configuration."
         }
       },
       "additionalProperties": false,
@@ -896,57 +900,6 @@
         "enabled": {
           "type": "boolean",
           "description": "Enabled signals this container should be enabled."
-        },
-        "command": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "Command is the command to start the distro binary. This will override the existing command."
-        },
-        "extraArgs": {
-          "items": {
-            "type": "string"
-          },
-          "type": "array",
-          "description": "ExtraArgs are additional arguments to pass to the distro binary."
-        }
-      },
-      "additionalProperties": false,
-      "type": "object"
-    },
-    "DistroK0s": {
-      "properties": {
-        "enabled": {
-          "type": "boolean",
-          "description": "Enabled specifies if the k0s distro should be enabled. Only one distro can be enabled at the same time."
-        },
-        "config": {
-          "type": "string",
-          "description": "Config allows you to override the k0s config passed to the k0s binary."
-        },
-        "image": {
-          "$ref": "#/$defs/Image",
-          "description": "Image is the distro image"
-        },
-        "imagePullPolicy": {
-          "type": "string",
-          "description": "ImagePullPolicy is the pull policy for the distro image"
-        },
-        "env": {
-          "items": {
-            "type": "object"
-          },
-          "type": "array",
-          "description": "Env are extra environment variables to use for the main container and NOT the init container."
-        },
-        "resources": {
-          "type": "object",
-          "description": "Resources for the distro init container"
-        },
-        "securityContext": {
-          "type": "object",
-          "description": "Security options can be used for the distro init container"
         },
         "command": {
           "items": {
@@ -1025,7 +978,7 @@
         },
         "version": {
           "type": "string",
-          "description": "Version specifies k8s components (scheduler, kube-controller-manager \u0026 apiserver) version.\nIt is a shortcut for controlPlane.distro.k8s.image.tag"
+          "description": "[Deprecated] Version field is deprecated.\nUse controlPlane.distro.k8s.image.tag to specify the Kubernetes version instead."
         },
         "apiServer": {
           "$ref": "#/$defs/DistroContainerEnabled",
@@ -1373,10 +1326,6 @@
           "type": "array",
           "description": "DenyProxyRequests denies certain requests in the vCluster proxy.",
           "pro": true
-        },
-        "reuseNamespace": {
-          "type": "boolean",
-          "description": "ReuseNamespace allows reusing the same namespace to create multiple vClusters.\nThis flag is deprecated, as this scenario will be removed entirely in upcoming releases."
         }
       },
       "additionalProperties": false,
@@ -1584,16 +1533,6 @@
     },
     "ExperimentalSyncSettings": {
       "properties": {
-        "disableSync": {
-          "type": "boolean",
-          "description": "DisableSync will not sync any resources and disable most control plane functionality.",
-          "pro": true
-        },
-        "rewriteKubernetesService": {
-          "type": "boolean",
-          "description": "RewriteKubernetesService will rewrite the Kubernetes service to point to the vCluster service if disableSync is enabled",
-          "pro": true
-        },
         "targetNamespace": {
           "type": "string",
           "description": "TargetNamespace is the namespace where the workloads should get synced to."
@@ -1889,7 +1828,7 @@
         },
         "stores": {
           "$ref": "#/$defs/EnableSwitch",
-          "description": "Stores defines if secret stores should get synced from the virtual cluster to the host cluster."
+          "description": "Stores defines if secret stores should get synced from the virtual cluster to the host cluster and then bi-directionally."
         },
         "clusterStores": {
           "$ref": "#/$defs/ClusterStoresSyncConfig",
@@ -1974,6 +1913,23 @@
       "additionalProperties": false,
       "type": "object"
     },
+    "HybridScheduling": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled specifies if hybrid scheduling is enabled."
+        },
+        "hostSchedulers": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "HostSchedulers is a list of schedulers that are deployed on the host cluster."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
     "IPBlock": {
       "properties": {
         "cidr": {
@@ -2003,7 +1959,7 @@
         },
         "tag": {
           "type": "string",
-          "description": "Tag is the tag of the container image, e.g. latest"
+          "description": "Tag is the tag of the container image, e.g. latest. If set to the default, it will use the host Kubernetes version."
         }
       },
       "additionalProperties": false,
@@ -2066,7 +2022,7 @@
         },
         "externalSecrets": {
           "$ref": "#/$defs/ExternalSecrets",
-          "description": "ExternalSecrets reuses a host external secret operator and makes certain CRDs from it available inside the vCluster.\n- ExternalSecrets will be synced from the virtual cluster to the host cluster.\n- SecretStores will be synced bi-directionally.\n- ClusterSecretStores will be synced from the host cluster to the virtual cluster."
+          "description": "ExternalSecrets reuses a host external secret operator and makes certain CRDs from it available inside the vCluster.\n- ExternalSecrets will be synced from the virtual cluster to the host cluster.\n- SecretStores will be synced from the virtual cluster to the host cluster and then bi-directionally.\n- ClusterSecretStores will be synced from the host cluster to the virtual cluster."
         },
         "certManager": {
           "$ref": "#/$defs/CertManager",
@@ -2113,6 +2069,26 @@
         },
         "virtualServices": {
           "$ref": "#/$defs/EnableSwitch"
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "Konnectivity": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled defines if the konnectivity should be enabled."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
+    },
+    "KubeProxy": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled defines if the kube proxy should be enabled."
         }
       },
       "additionalProperties": false,
@@ -2171,6 +2147,16 @@
       "additionalProperties": false,
       "type": "object",
       "description": "KubeVirtSync are the crds that are supported by this integration"
+    },
+    "Kubelet": {
+      "properties": {
+        "cgroupDriver": {
+          "type": "string",
+          "description": "CgroupDriver defines the cgroup driver to use for the kubelet."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object"
     },
     "LabelSelector": {
       "properties": {
@@ -2419,6 +2405,14 @@
     },
     "Networking": {
       "properties": {
+        "serviceCIDR": {
+          "type": "string",
+          "description": "ServiceCIDR holds the service cidr for the virtual cluster. This should only be set if privateNodes.enabled is true or vCluster cannot detect the host service cidr."
+        },
+        "podCIDR": {
+          "type": "string",
+          "description": "PodCIDR holds the pod cidr for the virtual cluster. This should only be set if privateNodes.enabled is true."
+        },
         "replicateServices": {
           "$ref": "#/$defs/ReplicateServices",
           "description": "ReplicateServices allows replicating services from the host within the virtual cluster or the other way around."
@@ -2840,6 +2834,25 @@
       },
       "additionalProperties": false,
       "type": "object"
+    },
+    "PrivateNodes": {
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enabled defines if dedicated nodes should be enabled."
+        },
+        "kubeProxy": {
+          "$ref": "#/$defs/KubeProxy",
+          "description": "KubeProxy holds dedicated kube proxy configuration."
+        },
+        "kubelet": {
+          "$ref": "#/$defs/Kubelet",
+          "description": "Kubelet holds dedicated kubelet configuration."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "PrivateNodes enables private nodes for vCluster."
     },
     "RBAC": {
       "properties": {
@@ -3441,6 +3454,10 @@
           },
           "type": "array",
           "description": "Patches patch the resource according to the provided specification."
+        },
+        "hybridScheduling": {
+          "$ref": "#/$defs/HybridScheduling",
+          "description": "HybridScheduling is used to enable and configure hybrid scheduling for pods in the virtual cluster."
         }
       },
       "additionalProperties": false,
@@ -3902,6 +3919,10 @@
     "controlPlane": {
       "$ref": "#/$defs/ControlPlane",
       "description": "Configure vCluster's control plane components and deployment."
+    },
+    "privateNodes": {
+      "$ref": "#/$defs/PrivateNodes",
+      "description": "PrivateNodes holds configuration for vCluster private nodes mode."
     },
     "rbac": {
       "$ref": "#/$defs/RBAC",

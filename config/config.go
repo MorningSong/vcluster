@@ -54,6 +54,9 @@ type Config struct {
 	// Configure vCluster's control plane components and deployment.
 	ControlPlane ControlPlane `json:"controlPlane,omitempty"`
 
+	// PrivateNodes holds configuration for vCluster private nodes mode.
+	PrivateNodes PrivateNodes `json:"privateNodes,omitempty"`
+
 	// RBAC options for the virtual cluster.
 	RBAC RBAC `json:"rbac,omitempty"`
 
@@ -82,6 +85,34 @@ type Config struct {
 	SleepMode *SleepMode `json:"sleepMode,omitempty"`
 }
 
+// PrivateNodes enables private nodes for vCluster. When turned on, vCluster will not sync resources to the host cluster
+// and instead act as a hosted control plane into which actual worker nodes can be joined via kubeadm or cluster api.
+type PrivateNodes struct {
+	// Enabled defines if dedicated nodes should be enabled.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// KubeProxy holds dedicated kube proxy configuration.
+	KubeProxy KubeProxy `json:"kubeProxy,omitempty"`
+
+	// Kubelet holds dedicated kubelet configuration.
+	Kubelet Kubelet `json:"kubelet,omitempty"`
+}
+
+type Kubelet struct {
+	// CgroupDriver defines the cgroup driver to use for the kubelet.
+	CgroupDriver string `json:"cgroupDriver,omitempty"`
+}
+
+type KubeProxy struct {
+	// Enabled defines if the kube proxy should be enabled.
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+type Konnectivity struct {
+	// Enabled defines if the konnectivity should be enabled.
+	Enabled bool `json:"enabled,omitempty"`
+}
+
 // Integrations holds config for vCluster integrations with other operators or tools running on the host cluster
 type Integrations struct {
 	// MetricsServer reuses the metrics server from the host cluster within the vCluster.
@@ -92,7 +123,7 @@ type Integrations struct {
 
 	// ExternalSecrets reuses a host external secret operator and makes certain CRDs from it available inside the vCluster.
 	// - ExternalSecrets will be synced from the virtual cluster to the host cluster.
-	// - SecretStores will be synced bi-directionally.
+	// - SecretStores will be synced from the virtual cluster to the host cluster and then bi-directionally.
 	// - ClusterSecretStores will be synced from the host cluster to the virtual cluster.
 	ExternalSecrets ExternalSecrets `json:"externalSecrets,omitempty"`
 
@@ -167,7 +198,7 @@ type ExternalSecrets struct {
 type ExternalSecretsSync struct {
 	// ExternalSecrets defines if external secrets should get synced from the virtual cluster to the host cluster.
 	ExternalSecrets EnableSwitch `json:"externalSecrets,omitempty"`
-	// Stores defines if secret stores should get synced from the virtual cluster to the host cluster.
+	// Stores defines if secret stores should get synced from the virtual cluster to the host cluster and then bi-directionally.
 	Stores EnableSwitch `json:"stores,omitempty"`
 	// ClusterStores defines if cluster secrets stores should get synced from the host cluster to the virtual cluster.
 	ClusterStores ClusterStoresSyncConfig `json:"clusterStores,omitempty"`
@@ -317,8 +348,6 @@ func (c *Config) EmbeddedDatabase() bool {
 func (c *Config) Distro() string {
 	if c.ControlPlane.Distro.K3S.Enabled {
 		return K3SDistro
-	} else if c.ControlPlane.Distro.K0S.Enabled {
-		return K0SDistro
 	} else if c.ControlPlane.Distro.K8S.Enabled {
 		return K8SDistro
 	}
@@ -389,14 +418,6 @@ func (c *Config) IsProFeatureEnabled() bool {
 	}
 
 	if c.ControlPlane.HostPathMapper.Central {
-		return true
-	}
-
-	if c.Experimental.SyncSettings.DisableSync {
-		return true
-	}
-
-	if c.Experimental.SyncSettings.RewriteKubernetesService {
 		return true
 	}
 
@@ -789,6 +810,9 @@ type SyncPods struct {
 
 	// Patches patch the resource according to the provided specification.
 	Patches []TranslatePatch `json:"patches,omitempty"`
+
+	// HybridScheduling is used to enable and configure hybrid scheduling for pods in the virtual cluster.
+	HybridScheduling HybridScheduling `json:"hybridScheduling,omitempty"`
 }
 
 type SyncRewriteHosts struct {
@@ -805,6 +829,14 @@ type SyncRewriteHostsInitContainer struct {
 
 	// Resources are the resources that should be assigned to the init container for each stateful set init container.
 	Resources Resources `json:"resources,omitempty"`
+}
+
+type HybridScheduling struct {
+	// Enabled specifies if hybrid scheduling is enabled.
+	Enabled bool `json:"enabled,omitempty"`
+
+	// HostSchedulers is a list of schedulers that are deployed on the host cluster.
+	HostSchedulers []string `json:"hostSchedulers,omitempty"`
 }
 
 type SyncNodes struct {
@@ -844,6 +876,12 @@ type ServiceMonitor struct {
 }
 
 type Networking struct {
+	// ServiceCIDR holds the service cidr for the virtual cluster. This should only be set if privateNodes.enabled is true or vCluster cannot detect the host service cidr.
+	ServiceCIDR string `json:"serviceCIDR,omitempty"`
+
+	// PodCIDR holds the pod cidr for the virtual cluster. This should only be set if privateNodes.enabled is true.
+	PodCIDR string `json:"podCIDR,omitempty"`
+
 	// ReplicateServices allows replicating services from the host within the virtual cluster or the other way around.
 	ReplicateServices ReplicateServices `json:"replicateServices,omitempty"`
 
@@ -1102,11 +1140,8 @@ type Distro struct {
 	// K8S holds K8s relevant configuration.
 	K8S DistroK8s `json:"k8s,omitempty"`
 
-	// K3S holds K3s relevant configuration.
+	// [Deprecated] K3S holds K3s relevant configuration.
 	K3S DistroK3s `json:"k3s,omitempty"`
-
-	// K0S holds k0s relevant configuration.
-	K0S DistroK0s `json:"k0s,omitempty"`
 }
 
 type DistroK3s struct {
@@ -1124,8 +1159,8 @@ type DistroK8s struct {
 	// Enabled specifies if the K8s distro should be enabled. Only one distro can be enabled at the same time.
 	Enabled bool `json:"enabled,omitempty"`
 
-	// Version specifies k8s components (scheduler, kube-controller-manager & apiserver) version.
-	// It is a shortcut for controlPlane.distro.k8s.image.tag
+	// [Deprecated] Version field is deprecated.
+	// Use controlPlane.distro.k8s.image.tag to specify the Kubernetes version instead.
 	Version string `json:"version,omitempty"`
 
 	// APIServer holds configuration specific to starting the api server.
@@ -1138,17 +1173,6 @@ type DistroK8s struct {
 	Scheduler DistroContainer `json:"scheduler,omitempty"`
 
 	DistroCommon `json:",inline"`
-}
-
-type DistroK0s struct {
-	// Enabled specifies if the k0s distro should be enabled. Only one distro can be enabled at the same time.
-	Enabled bool `json:"enabled,omitempty"`
-
-	// Config allows you to override the k0s config passed to the k0s binary.
-	Config string `json:"config,omitempty"`
-
-	DistroCommon    `json:",inline"`
-	DistroContainer `json:",inline"`
 }
 
 type DistroCommon struct {
@@ -1208,7 +1232,7 @@ type Image struct {
 	// Repository is the repository of the container image, e.g. my-repo/my-image
 	Repository string `json:"repository,omitempty"`
 
-	// Tag is the tag of the container image, e.g. latest
+	// Tag is the tag of the container image, e.g. latest. If set to the default, it will use the host Kubernetes version.
 	Tag string `json:"tag,omitempty"`
 }
 
@@ -1428,6 +1452,9 @@ type CoreDNS struct {
 	// Embedded defines if vCluster will start the embedded coredns service within the control-plane and not as a separate deployment. This is a PRO feature.
 	Embedded bool `json:"embedded,omitempty" product:"pro"`
 
+	// Security defines pod or container security context.
+	Security ControlPlaneSecurity `json:"security,omitempty"`
+
 	// Service holds extra options for the coredns service deployed within the virtual cluster
 	Service CoreDNSService `json:"service,omitempty"`
 
@@ -1556,6 +1583,9 @@ type ControlPlaneAdvanced struct {
 
 	// HeadlessService specifies options for the headless service used for the vCluster StatefulSet.
 	HeadlessService ControlPlaneHeadlessService `json:"headlessService,omitempty"`
+
+	// Konnectivity holds dedicated konnectivity configuration. This is only available when privateNodes.enabled is true.
+	Konnectivity Konnectivity `json:"konnectivity,omitempty"`
 
 	// GlobalMetadata is metadata that will be added to all resources deployed by Helm.
 	GlobalMetadata ControlPlaneGlobalMetadata `json:"globalMetadata,omitempty"`
@@ -2071,10 +2101,6 @@ type Experimental struct {
 
 	// DenyProxyRequests denies certain requests in the vCluster proxy.
 	DenyProxyRequests []DenyRule `json:"denyProxyRequests,omitempty" product:"pro"`
-
-	// ReuseNamespace allows reusing the same namespace to create multiple vClusters.
-	// This flag is deprecated, as this scenario will be removed entirely in upcoming releases.
-	ReuseNamespace bool `json:"reuseNamespace,omitempty"`
 }
 
 func (e Experimental) JSONSchemaExtend(base *jsonschema.Schema) {
@@ -2107,12 +2133,6 @@ type ExperimentalIsolatedControlPlane struct {
 }
 
 type ExperimentalSyncSettings struct {
-	// DisableSync will not sync any resources and disable most control plane functionality.
-	DisableSync bool `json:"disableSync,omitempty" product:"pro"`
-
-	// RewriteKubernetesService will rewrite the Kubernetes service to point to the vCluster service if disableSync is enabled
-	RewriteKubernetesService bool `json:"rewriteKubernetesService,omitempty" product:"pro"`
-
 	// TargetNamespace is the namespace where the workloads should get synced to.
 	TargetNamespace string `json:"targetNamespace,omitempty"`
 
