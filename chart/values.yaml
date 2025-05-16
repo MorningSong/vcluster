@@ -33,6 +33,12 @@ sync:
       translateImage: {}
       # EnforceTolerations will add the specified tolerations to all pods synced by the virtual cluster.
       enforceTolerations: []
+      # HybridScheduling is used to enable and configure hybrid scheduling for pods in the virtual cluster.
+      hybridScheduling:
+        # Enabled specifies if hybrid scheduling is enabled.
+        enabled: false
+        # HostSchedulers is a list of schedulers that are deployed on the host cluster.
+        hostSchedulers: []
       # UseSecretsForSATokens will use secrets to save the generated service account tokens by virtual cluster instead of using a
       # pod annotation.
       useSecretsForSATokens: false
@@ -205,8 +211,8 @@ controlPlane:
     k8s:
       # Enabled specifies if the K8s distro should be enabled. Only one distro can be enabled at the same time.
       enabled: false
-      # Version specifies k8s components (scheduler, kube-controller-manager & apiserver) version.
-      # It is a shortcut for controlPlane.distro.k8s.image.tag
+      # [Deprecated] Version field is deprecated.
+      # Use controlPlane.distro.k8s.image.tag to specify the Kubernetes version instead.
       version: ""
       # ImagePullPolicy is the pull policy for the distro image
       imagePullPolicy: ""
@@ -217,7 +223,7 @@ controlPlane:
         registry: ghcr.io
         # Repository is the repository of the container image, e.g. my-repo/my-image
         repository: "loft-sh/kubernetes"
-        # Tag is the tag of the container image, e.g. latest
+        # Tag is the tag of the container image, e.g. latest. If set to the default, it will use the host Kubernetes version.
         tag: "v1.32.1"
       # APIServer holds configuration specific to starting the api server.
       apiServer:
@@ -251,7 +257,7 @@ controlPlane:
         requests:
           cpu: 40m
           memory: 64Mi
-    # K3S holds K3s relevant configuration.
+    # [Deprecated] K3S holds K3s relevant configuration.
     k3s:
       # Enabled specifies if the K3s distro should be enabled. Only one distro can be enabled at the same time.
       enabled: false
@@ -268,39 +274,8 @@ controlPlane:
         registry: ""
         # Repository is the repository of the container image, e.g. my-repo/my-image
         repository: "rancher/k3s"
-        # Tag is the tag of the container image, e.g. latest
+        # Tag is the tag of the container image, e.g. latest. If set to the default, it will use the host Kubernetes version.
         tag: "v1.32.1-k3s1"
-      # Security options can be used for the distro init container
-      securityContext: {}
-      # Resources for the distro init container
-      resources:
-        limits:
-          cpu: 100m
-          memory: 256Mi
-        requests:
-          cpu: 40m
-          memory: 64Mi
-    # K0S holds k0s relevant configuration.
-    k0s:
-      # Enabled specifies if the k0s distro should be enabled. Only one distro can be enabled at the same time.
-      enabled: false
-      # Config allows you to override the k0s config passed to the k0s binary.
-      config: ""
-      # Command is the command to start the distro binary. This will override the existing command.
-      command: []
-      # ExtraArgs are additional arguments to pass to the distro binary.
-      extraArgs: []
-      # ImagePullPolicy is the pull policy for the distro image
-      imagePullPolicy: ""
-      # Image is the distro image
-      image:
-        # Registry is the registry of the container image, e.g. my-registry.com or ghcr.io. This setting can be globally
-        # overridden via the controlPlane.advanced.defaultImageRegistry option. Empty means docker hub.
-        registry: ""
-        # Repository is the repository of the container image, e.g. my-repo/my-image
-        repository: "k0sproject/k0s"
-        # Tag is the tag of the container image, e.g. latest
-        tag: "v1.30.2-k0s.0"
       # Security options can be used for the distro init container
       securityContext: {}
       # Resources for the distro init container
@@ -381,7 +356,7 @@ controlPlane:
             registry: "registry.k8s.io"
             # Repository is the repository of the container image, e.g. my-repo/my-image
             repository: "etcd"
-            # Tag is the tag of the container image, e.g. latest
+            # Tag is the tag of the container image, e.g. latest. If set to the default, it will use the host Kubernetes version.
             tag: "3.5.21-0"
           # ImagePullPolicy is the pull policy for the external etcd image
           imagePullPolicy: ""
@@ -472,6 +447,12 @@ controlPlane:
     overwriteConfig: ""
     # PriorityClassName specifies the priority class name for the CoreDNS pods.
     priorityClassName: ""
+    # Security defines pod or container security context.
+    security:
+      # PodSecurityContext specifies security context options on the pod level.
+      podSecurityContext: {}
+      # ContainerSecurityContext specifies security context options on the container level.
+      containerSecurityContext: {}
     # Service holds extra options for the coredns service deployed within the virtual cluster
     service:
       annotations: {}
@@ -702,9 +683,23 @@ controlPlane:
     headlessService:
       labels: {}
       annotations: {}
+    # Konnectivity holds dedicated konnectivity configuration. This is only available when privateNodes.enabled is true.
+    konnectivity:
+      # Enabled defines if the konnectivity should be enabled.
+      enabled: true
     # GlobalMetadata is metadata that will be added to all resources deployed by Helm.
     globalMetadata:
       annotations: {}
+
+# PrivateNodes holds configuration for vCluster private nodes mode.
+privateNodes:
+  # Enabled defines if dedicated nodes should be enabled.
+  enabled: false
+  
+  # KubeProxy holds dedicated kube proxy configuration.
+  kubeProxy:
+    # Enabled defines if the kube proxy should be enabled.
+    enabled: true
 
 # Integrations holds config for vCluster integrations with other operators or tools running on the host cluster
 integrations:
@@ -719,7 +714,7 @@ integrations:
   
   # ExternalSecrets reuses a host external secret operator and makes certain CRDs from it available inside the vCluster.
   # - ExternalSecrets will be synced from the virtual cluster to the host cluster.
-  # - SecretStores will be synced bi-directionally.
+  # - SecretStores will be synced from the virtual cluster to the host cluster and then bi-directionally.
   # - ClusterSecretStores will be synced from the host cluster to the virtual cluster.
   externalSecrets:
     # Enabled defines whether the external secret integration is enabled or not
@@ -732,7 +727,7 @@ integrations:
       # ExternalSecrets defines if external secrets should get synced from the virtual cluster to the host cluster.
       externalSecrets:
         enabled: true
-      # Stores defines if secret stores should get synced from the virtual cluster to the host cluster.
+      # Stores defines if secret stores should get synced from the virtual cluster to the host cluster and then bi-directionally.
       stores:
         enabled: false
       # ClusterStores defines if cluster secrets stores should get synced from the host cluster to the virtual cluster.
@@ -830,6 +825,9 @@ rbac:
 
 # Networking options related to the virtual cluster.
 networking:
+  # PodCIDR holds the pod cidr for the virtual cluster. This should only be set if privateNodes.enabled is true.
+  podCIDR: "10.244.0.0/16"
+  
   # ReplicateServices allows replicating services from the host within the virtual cluster or the other way around.
   replicateServices:
     # ToHost defines the services that should get synced from virtual cluster to the host cluster. If services are
@@ -1002,10 +1000,6 @@ experimental:
   
   # SyncSettings are advanced settings for the syncer controller.
   syncSettings:
-    # DisableSync will not sync any resources and disable most control plane functionality.
-    disableSync: false
-    # RewriteKubernetesService will rewrite the Kubernetes service to point to the vCluster service if disableSync is enabled
-    rewriteKubernetesService: false
     # TargetNamespace is the namespace where the workloads should get synced to.
     targetNamespace: ""
     # SetOwner specifies if vCluster should set an owner reference on the synced objects to the vCluster service. This allows for easy garbage collection.
@@ -1039,10 +1033,6 @@ experimental:
       extraRules: []
     role:
       extraRules: []
-  
-  # ReuseNamespace allows reusing the same namespace to create multiple vClusters.
-  # This flag is deprecated, as this scenario will be removed entirely in upcoming releases.
-  reuseNamespace: false
 
 # Configuration related to telemetry gathered about vCluster usage.
 telemetry:

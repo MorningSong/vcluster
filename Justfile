@@ -57,8 +57,8 @@ generate-vcluster-latest-images version="0.0.0":
 
 # Generate the vcluster optional images file
 [private]
-generate-vcluster-optional-images:
-  {{ASSETS_RUN}} --optional > ./release/images-optional.txt
+generate-vcluster-optional-images version="0.0.0":
+  {{ASSETS_RUN}} --optional {{ version }} > ./release/images-optional.txt
 
 # Generate versioned vCluster image files for multiple versions and distros
 [private]
@@ -73,10 +73,6 @@ generate-matrix-specific-images version="0.0.0":
     done
   done
 
-# Generate the CLI docs
-generate-cli-docs:
-  go run -mod vendor -tags pro ./hack/docs/main.go
-
 # Generate the vcluster.yaml config schema
 generate-config-schema:
   go run -mod vendor ./hack/schema/main.go
@@ -85,6 +81,9 @@ generate-config-schema:
 [private]
 embed-chart version="0.0.0":
   RELEASE_VERSION={{ version }} go generate -tags embed_chart ./...
+
+test-chart:
+  helm unittest chart
 
 # Run e2e tests
 e2e distribution="k3s" path="./test/e2e" multinamespace="false": create-kind && delete-kind

@@ -28,6 +28,7 @@
     .Values.sync.toHost.volumeSnapshotContents.enabled
     .Values.sync.fromHost.volumeSnapshotClasses.enabled
     .Values.controlPlane.advanced.virtualScheduler.enabled
+    .Values.sync.toHost.pods.hybridScheduling.enabled
     .Values.sync.fromHost.ingressClasses.enabled
     .Values.sync.fromHost.runtimeClasses.enabled
     (eq (toString .Values.sync.fromHost.storageClasses.enabled) "true")
@@ -43,7 +44,9 @@
     (and .Values.integrations.metricsServer.enabled .Values.integrations.metricsServer.nodes)
     .Values.experimental.multiNamespaceMode.enabled
 	.Values.sync.fromHost.configMaps.enabled
-    .Values.sync.fromHost.secrets.enabled -}}
+    .Values.sync.fromHost.secrets.enabled
+     .Values.integrations.istio.enabled
+     -}}
 {{- true -}}
 {{- end -}}
 {{- end -}}
