@@ -30,8 +30,8 @@ func MigrateLegacyConfig(distro, oldValues string) (string, error) {
 	}
 
 	switch distro {
-	case config.K0SDistro, config.K3SDistro:
-		err = migrateK3sAndK0s(distro, oldValues, toConfig)
+	case config.K3SDistro:
+		err = migrateK3s(distro, oldValues, toConfig)
 		if err != nil {
 			return "", fmt.Errorf("migrate legacy %s values: %w", distro, err)
 		}
@@ -104,9 +104,9 @@ func migrateK8sAndEKS(oldValues string, newConfig *config.Config) error {
 	return nil
 }
 
-func migrateK3sAndK0s(distro, oldValues string, newConfig *config.Config) error {
+func migrateK3s(distro, oldValues string, newConfig *config.Config) error {
 	// unmarshal legacy config
-	oldConfig := &LegacyK0sAndK3s{}
+	oldConfig := &LegacyK3s{}
 	err := oldConfig.UnmarshalYAMLStrict([]byte(oldValues))
 	if err != nil {
 		if err := errIfConfigIsAlreadyConverted(oldValues); err != nil {
@@ -115,16 +115,7 @@ func migrateK3sAndK0s(distro, oldValues string, newConfig *config.Config) error 
 		return fmt.Errorf("unmarshal legacy config: %w", err)
 	}
 
-	// distro specific
-	if distro == config.K0SDistro {
-		newConfig.ControlPlane.Distro.K0S.Enabled = true
-
-		// vcluster config
-		err = convertVClusterConfig(oldConfig.VCluster, &newConfig.ControlPlane.Distro.K0S.DistroCommon, &newConfig.ControlPlane.Distro.K0S.DistroContainer, newConfig)
-		if err != nil {
-			return fmt.Errorf("error converting vcluster config: %w", err)
-		}
-	} else if distro == config.K3SDistro {
+	if distro == config.K3SDistro {
 		newConfig.ControlPlane.Distro.K3S.Enabled = true
 		newConfig.ControlPlane.Distro.K3S.Token = oldConfig.K3sToken
 
@@ -318,7 +309,7 @@ func convertBaseValues(oldConfig BaseHelm, newConfig *config.Config) error {
 	}
 
 	if oldConfig.MultiNamespaceMode.Enabled != nil {
-		newConfig.Experimental.MultiNamespaceMode.Enabled = *oldConfig.MultiNamespaceMode.Enabled
+		newConfig.Sync.ToHost.Namespaces.Enabled = *oldConfig.MultiNamespaceMode.Enabled
 	}
 
 	if len(oldConfig.SecurityContext) > 0 {
@@ -363,26 +354,6 @@ func convertBaseValues(oldConfig BaseHelm, newConfig *config.Config) error {
 	}
 	if oldConfig.Rbac.ClusterRole.Create != nil && *oldConfig.Rbac.ClusterRole.Create {
 		newConfig.RBAC.ClusterRole.Enabled = "true"
-	}
-
-	if oldConfig.NoopSyncer.Enabled {
-		newConfig.Experimental.SyncSettings.DisableSync = true
-		if oldConfig.NoopSyncer.Secret.KubeConfig != "" {
-			newConfig.Experimental.VirtualClusterKubeConfig.KubeConfig = oldConfig.NoopSyncer.Secret.KubeConfig
-		}
-		if oldConfig.NoopSyncer.Secret.ClientCaCert != "" {
-			newConfig.Experimental.VirtualClusterKubeConfig.ClientCACert = oldConfig.NoopSyncer.Secret.ClientCaCert
-		}
-		if oldConfig.NoopSyncer.Secret.ServerCaKey != "" {
-			newConfig.Experimental.VirtualClusterKubeConfig.ServerCAKey = oldConfig.NoopSyncer.Secret.ServerCaKey
-		}
-		if oldConfig.NoopSyncer.Secret.ServerCaCert != "" {
-			newConfig.Experimental.VirtualClusterKubeConfig.ServerCACert = oldConfig.NoopSyncer.Secret.ServerCaCert
-		}
-		if oldConfig.NoopSyncer.Secret.RequestHeaderCaCert != "" {
-			newConfig.Experimental.VirtualClusterKubeConfig.RequestHeaderCACert = oldConfig.NoopSyncer.Secret.RequestHeaderCaCert
-		}
-		newConfig.Experimental.SyncSettings.RewriteKubernetesService = oldConfig.NoopSyncer.Synck8sService
 	}
 
 	newConfig.Experimental.Deploy.VCluster.Manifests = oldConfig.Init.Manifests
@@ -1012,13 +983,13 @@ func migrateFlag(key, value string, newConfig *config.Config) error {
 		}
 	case "multi-namespace-mode":
 		if value == "" || value == "true" {
-			newConfig.Experimental.MultiNamespaceMode.Enabled = true
+			newConfig.Sync.ToHost.Namespaces.Enabled = true
 		}
 	case "namespace-labels":
 		if value == "" {
 			return fmt.Errorf("value is missing")
 		}
-		newConfig.Experimental.MultiNamespaceMode.NamespaceLabels = mergeIntoMap(newConfig.Experimental.MultiNamespaceMode.NamespaceLabels, strings.Split(value, ","))
+		newConfig.Sync.ToHost.Namespaces.ExtraLabels = mergeIntoMap(newConfig.Sync.ToHost.Namespaces.ExtraLabels, strings.Split(value, ","))
 	case "sync-all-configmaps":
 		if value == "" || value == "true" {
 			newConfig.Sync.ToHost.ConfigMaps.All = true

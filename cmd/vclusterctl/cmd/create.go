@@ -2,9 +2,9 @@ package cmd
 
 import (
 	"cmp"
-	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/loft-sh/log"
 	"github.com/loft-sh/vcluster/pkg/cli"
@@ -22,8 +22,7 @@ type CreateCmd struct {
 	*flags.GlobalFlags
 	cli.CreateOptions
 
-	log            log.Logger
-	reuseNamespace bool
+	log log.Logger
 }
 
 // NewCreateCmd creates a new command
@@ -61,14 +60,11 @@ vcluster create test --namespace test
 			// Check for newer version
 			upgrade.PrintNewerVersionWarning()
 
-			return cmd.Run(cobraCmd.Context(), newArgs)
+			return cmd.Run(cobraCmd, newArgs)
 		},
 	}
 
 	cobraCmd.Flags().StringVar(&cmd.Driver, "driver", "", "The driver to use for managing the virtual cluster, can be either helm or platform.")
-	cobraCmd.Flags().BoolVar(&cmd.reuseNamespace, "reuse-namespace", false, "Allows to create multiple virtual clusters in a single namespace")
-	cobraCmd.Flag("reuse-namespace").Hidden = true
-	_ = cobraCmd.Flags().MarkDeprecated("reuse-namespace", "creation of multiple virtual clusters within the same namespace is deprecated.")
 
 	create.AddCommonFlags(cobraCmd, &cmd.CreateOptions)
 	create.AddHelmFlags(cobraCmd, &cmd.CreateOptions)
@@ -78,7 +74,7 @@ vcluster create test --namespace test
 }
 
 // Run executes the functionality
-func (cmd *CreateCmd) Run(ctx context.Context, args []string) error {
+func (cmd *CreateCmd) Run(cobraCmd *cobra.Command, args []string) error {
 	if !cmd.UpdateCurrent {
 		cmd.log.Warnf("%q has no effect anymore. Please consider using %q", "--update-current=false", "--connect=false")
 	}
@@ -91,6 +87,8 @@ func (cmd *CreateCmd) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("parse driver type: %w", err)
 	}
 
+	ctx := cobraCmd.Context()
+
 	// check if there is a platform client or we skip the info message
 	_, err = platform.InitClientFromConfig(ctx, cfg)
 	if err == nil {
@@ -102,5 +100,18 @@ func (cmd *CreateCmd) Run(ctx context.Context, args []string) error {
 		return cli.CreatePlatform(ctx, &cmd.CreateOptions, cmd.GlobalFlags, args[0], cmd.log)
 	}
 
-	return cli.CreateHelm(ctx, &cmd.CreateOptions, cmd.GlobalFlags, args[0], cmd.log, cmd.reuseNamespace)
+	// log error if platform flags have been set when using driver helm
+	var fs []string
+	pfs := create.ChangedPlatformFlags(cobraCmd)
+	for pf, changed := range pfs {
+		if changed {
+			fs = append(fs, pf)
+		}
+	}
+
+	if len(fs) > 0 {
+		cmd.log.Fatalf("Following platform flags have been set, which won't have any effect when using driver type %s: %s", config.HelmDriver, strings.Join(fs, ", "))
+	}
+
+	return cli.CreateHelm(ctx, &cmd.CreateOptions, cmd.GlobalFlags, args[0], cmd.log)
 }
