@@ -292,7 +292,7 @@ func startEmbeddedBackingStore(ctx context.Context, vConfig *config.VirtualClust
 				return fmt.Errorf("failed to create directory %s: %w", filepath.Dir(constants.K3sSqliteDatabase), err)
 			}
 
-			k8s.StartKine(ctx, fmt.Sprintf("sqlite://%s?_journal=WAL&cache=shared&_busy_timeout=30000", constants.K3sSqliteDatabase), constants.K3sKineEndpoint, nil)
+			k8s.StartKine(ctx, fmt.Sprintf("sqlite://%s?_journal=WAL&cache=shared&_busy_timeout=30000", constants.K3sSqliteDatabase), constants.K3sKineEndpoint, nil, nil)
 		} else {
 			return fmt.Errorf("unsupported distro: %s", vConfig.Distro())
 		}
@@ -320,6 +320,7 @@ func startEmbeddedBackingStore(ctx context.Context, vConfig *config.VirtualClust
 			"",
 			false,
 			false,
+			vConfig.ControlPlane.BackingStore.Etcd.Embedded.ExtraArgs,
 		)
 		if err != nil {
 			return fmt.Errorf("start embedded etcd: %w", err)
@@ -343,18 +344,14 @@ func generateCertificates(ctx context.Context, vConfig *config.VirtualClusterCon
 	}
 
 	// retrieve service cidr
-	serviceCIDR := vConfig.ServiceCIDR
-	if serviceCIDR == "" {
-		var warning string
-		serviceCIDR, warning = servicecidr.GetServiceCIDR(ctx, vConfig.WorkloadClient, vConfig.WorkloadNamespace)
-		if warning != "" {
-			klog.Warning(warning)
-		}
+	serviceCIDR, err := servicecidr.GetServiceCIDR(ctx, &vConfig.Config, vConfig.WorkloadClient, vConfig.WorkloadService, vConfig.WorkloadNamespace)
+	if err != nil {
+		return "", fmt.Errorf("failed to get service cidr: %w", err)
 	}
 
 	// generate etcd certificates
 	certificatesDir := "/data/pki"
-	err = setup.GenerateCerts(ctx, vConfig.ControlPlaneClient, vConfig.Name, vConfig.ControlPlaneNamespace, serviceCIDR, certificatesDir, vConfig)
+	err = setup.GenerateCerts(ctx, serviceCIDR, certificatesDir, vConfig)
 	if err != nil {
 		return "", err
 	}
