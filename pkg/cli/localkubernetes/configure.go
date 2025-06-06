@@ -22,6 +22,8 @@ import (
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 )
 
+const dockerInternalHostName = "host.docker.internal"
+
 func (c ClusterType) LocalKubernetes() bool {
 	return c == ClusterTypeDockerDesktop ||
 		c == ClusterTypeRancherDesktop ||
@@ -111,7 +113,7 @@ func directConnection(ctx context.Context, vRawConfig *clientcmdapi.Config, serv
 
 // CreateBackgroundProxyContainer runs kubectl port-forward in a docker container, forwarding from the vcluster service
 // on the host cluster to a port matching the kubernetes context for the virtual cluster.
-func CreateBackgroundProxyContainer(_ context.Context, vClusterName, vClusterNamespace string, rawConfig clientcmd.ClientConfig, localPort int, log log.Logger) (string, error) {
+func CreateBackgroundProxyContainer(_ context.Context, vClusterName, vClusterNamespace string, proxyImage string, rawConfig clientcmd.ClientConfig, localPort int, log log.Logger) (string, error) {
 	rawConfigObj, err := rawConfig.RawConfig()
 	if err != nil {
 		return "", err
@@ -128,7 +130,7 @@ func CreateBackgroundProxyContainer(_ context.Context, vClusterName, vClusterNam
 	// check if the background proxy container for this vcluster is running and then remove it.
 	_ = CleanupBackgroundProxy(proxyName, log)
 
-	cmd, err := buildDockerCommand(physicalRawConfig, proxyName, vClusterName, vClusterNamespace, localPort)
+	cmd, err := buildDockerCommand(physicalRawConfig, proxyName, vClusterName, vClusterNamespace, proxyImage, localPort)
 	if err != nil {
 		return "", fmt.Errorf("build docker command: %w", err)
 	}
@@ -142,7 +144,7 @@ func CreateBackgroundProxyContainer(_ context.Context, vClusterName, vClusterNam
 }
 
 // build a different docker command for darwin vs. everything else
-func buildDockerCommand(physicalRawConfig clientcmdapi.Config, proxyName, vClusterName, vClusterNamespace string, localPort int) (*exec.Cmd, error) {
+func buildDockerCommand(physicalRawConfig clientcmdapi.Config, proxyName, vClusterName, vClusterNamespace string, proxyImage string, localPort int) (*exec.Cmd, error) {
 	// write a temporary kube file
 	tempFile, err := os.CreateTemp("", "")
 	if err != nil {
@@ -151,7 +153,15 @@ func buildDockerCommand(physicalRawConfig clientcmdapi.Config, proxyName, vClust
 
 	kubeConfigPath := tempFile.Name()
 
-	var cmd *exec.Cmd
+	dockerArgs := []string{
+		"run",
+		"--rm",
+		"-d",
+		"-v", fmt.Sprintf("%v:%v", kubeConfigPath, "/kube-config"),
+		fmt.Sprintf("--name=%s", proxyName),
+		"--entrypoint=/vcluster",
+	}
+
 	// For non-linux, update the kube config to point to the special host.docker.internal and don't use
 	// host networking.
 	if runtime.GOOS != "linux" {
@@ -160,16 +170,10 @@ func buildDockerCommand(physicalRawConfig clientcmdapi.Config, proxyName, vClust
 			return nil, fmt.Errorf("update config: %w", err)
 		}
 
-		cmd = exec.Command(
-			"docker",
-			"run",
-			"--rm",
-			"-d",
-			"-v", fmt.Sprintf("%v:%v", kubeConfigPath, "/kube-config"),
-			fmt.Sprintf("--name=%s", proxyName),
+		dockerArgs = append(dockerArgs,
 			"-p",
 			fmt.Sprintf("%d:8443", localPort),
-			"bitnami/kubectl:1.29",
+			proxyImage,
 			"port-forward",
 			"svc/"+vClusterName,
 			"--address=0.0.0.0",
@@ -178,15 +182,9 @@ func buildDockerCommand(physicalRawConfig clientcmdapi.Config, proxyName, vClust
 			"-n", vClusterNamespace,
 		)
 	} else {
-		cmd = exec.Command(
-			"docker",
-			"run",
-			"--rm",
-			"-d",
-			"-v", fmt.Sprintf("%v:%v", kubeConfigPath, "/kube-config"),
-			fmt.Sprintf("--name=%s", proxyName),
+		dockerArgs = append(dockerArgs,
 			"--network=host",
-			"bitnami/kubectl:1.29",
+			proxyImage,
 			"port-forward",
 			"svc/"+vClusterName,
 			"--address=0.0.0.0",
@@ -195,6 +193,8 @@ func buildDockerCommand(physicalRawConfig clientcmdapi.Config, proxyName, vClust
 			"-n", vClusterNamespace,
 		)
 	}
+
+	cmd := exec.Command("docker", dockerArgs...)
 
 	// write kube config to buffer
 	physicalCluster, err := clientcmd.Write(physicalRawConfig)
@@ -233,7 +233,10 @@ func updateConfigForDockerToHost(rawConfig clientcmdapi.Config) (clientcmdapi.Co
 	localCluster := updated.Clusters["local"]
 	localCluster.InsecureSkipTLSVerify = true
 	localCluster.CertificateAuthorityData = nil
-	localCluster.Server = strings.ReplaceAll(localCluster.Server, "127.0.0.1", "host.docker.internal")
+
+	localCluster.Server = strings.ReplaceAll(localCluster.Server, "127.0.0.1", dockerInternalHostName)
+	localCluster.Server = strings.ReplaceAll(localCluster.Server, "0.0.0.0", dockerInternalHostName)
+	localCluster.Server = strings.ReplaceAll(localCluster.Server, "localhost", dockerInternalHostName)
 
 	return *updated, nil
 }

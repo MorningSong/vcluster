@@ -3,30 +3,20 @@
 {{ include "vcluster.k3s.initContainers" . }}
 {{- else if eq (include "vcluster.distro" .) "k8s" -}}
 {{ include "vcluster.k8s.initContainers" . }}
-{{- else if eq (include "vcluster.distro" .) "k0s" -}}
-{{ include "vcluster.k0s.initContainers" . }}
-{{- end -}}
-{{- end -}}
-
-{{- define "vcluster.k8s.capabilities.version" -}}
-{{/* We need to workaround here for unit tests because Capabilities.KubeVersion.Version is not supported, so we use .Chart.Version */}}
-{{- if hasPrefix "test-" .Chart.Version -}}
-{{- regexFind "^v[0-9]+\\.[0-9]+\\.[0-9]+" (trimPrefix "test-" .Chart.Version) -}}
-{{- else -}}
-{{- regexFind "^v[0-9]+\\.[0-9]+\\.[0-9]+" .Capabilities.KubeVersion.Version -}}
 {{- end -}}
 {{- end -}}
 
 {{/* Bump $defaultTag value whenever k8s version is bumped */}}
 {{- define "vcluster.k8s.image.tag" -}}
-{{- $defaultTag := "v1.32.1" -}}
-{{- if and (not (empty .Values.controlPlane.distro.k8s.version)) (eq .Values.controlPlane.distro.k8s.image.tag $defaultTag) -}}
-{{ .Values.controlPlane.distro.k8s.version }}
+{{- if not (empty .Values.controlPlane.distro.k8s.version) -}}
+{{- if and .Values.privateNodes.enabled .Values.privateNodes.importNodeBinaries -}}
+{{ .Values.controlPlane.distro.k8s.version }}-full
 {{- else -}}
-{{- if not (eq .Values.controlPlane.distro.k8s.image.tag $defaultTag) -}}
-{{ .Values.controlPlane.distro.k8s.image.tag }}
-{{- else if not (empty (include "vcluster.k8s.capabilities.version" .)) -}}
-{{ include "vcluster.k8s.capabilities.version" . }}
+{{ .Values.controlPlane.distro.k8s.version }}
+{{- end -}}
+{{- else -}}
+{{- if and .Values.privateNodes.enabled .Values.privateNodes.importNodeBinaries -}}
+{{ .Values.controlPlane.distro.k8s.image.tag }}-full
 {{- else -}}
 {{ .Values.controlPlane.distro.k8s.image.tag }}
 {{- end -}}
@@ -76,28 +66,6 @@
       mountPath: /binaries
   resources:
 {{ toYaml .Values.controlPlane.distro.k3s.resources | indent 4 }}
-{{- end -}}
-
-{{- define "vcluster.k0s.initContainers" -}}
-{{- include "vcluster.oldPlugins.initContainers" . }}
-{{- include "vcluster.plugins.initContainers" . }}
-- name: vcluster
-  image: "{{ include "vcluster.image" (dict "defaultImageRegistry" .Values.controlPlane.advanced.defaultImageRegistry "registry" .Values.controlPlane.distro.k0s.image.registry "repository" .Values.controlPlane.distro.k0s.image.repository "tag" .Values.controlPlane.distro.k0s.image.tag) }}"
-  command:
-    - /bin/sh
-  args:
-    - -c
-    - "cp /usr/local/bin/k0s /binaries/k0s"
-  {{- if .Values.controlPlane.distro.k0s.imagePullPolicy }}
-  imagePullPolicy: {{ .Values.controlPlane.distro.k0s.imagePullPolicy }}
-  {{- end }}
-  securityContext:
-{{ toYaml .Values.controlPlane.distro.k0s.securityContext | indent 4 }}
-  volumeMounts:
-    - name: binaries
-      mountPath: /binaries
-  resources:
-{{ toYaml .Values.controlPlane.distro.k0s.resources | indent 4 }}
 {{- end -}}
 
 {{/*

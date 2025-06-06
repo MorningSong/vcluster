@@ -19,6 +19,9 @@ sync:
       enabled: true
       translateImage: {}
       enforceTolerations: []
+      hybridScheduling:
+        enabled: false
+        hostSchedulers: []
       useSecretsForSATokens: false
       runtimeClassName: ""
       priorityClassName: ""
@@ -51,6 +54,11 @@ sync:
       enabled: false
     persistentVolumes:
       enabled: false
+    namespaces:
+      enabled: false
+      mappingsOnly: false
+      hostNamespaces:
+        cleanup: "synced"
 
   fromHost:
     events:
@@ -136,29 +144,11 @@ controlPlane:
           cpu: 40m
           memory: 64Mi
 
-    k0s:
-      enabled: false
-      config: ""
-      command: []
-      extraArgs: []
-      imagePullPolicy: ""
-      image:
-        registry: ""
-        repository: "k0sproject/k0s"
-        tag: "v1.30.2-k0s.0"
-      securityContext: {}
-      resources:
-        limits:
-          cpu: 100m
-          memory: 256Mi
-        requests:
-          cpu: 40m
-          memory: 64Mi
-
   backingStore:
     database:
       embedded:
         enabled: false
+        extraArgs: []
       external:
         enabled: false
         dataSource: ""
@@ -166,10 +156,12 @@ controlPlane:
         certFile: ""
         keyFile: ""
         caFile: ""
+        extraArgs: []
     etcd:
       embedded:
         enabled: false
         migrateFromDeployedEtcd: false
+        extraArgs: []
       external:
         enabled: false
         endpoint: ""
@@ -237,6 +229,9 @@ controlPlane:
     overwriteManifests: ""
     overwriteConfig: ""
     priorityClassName: ""
+    security:
+      podSecurityContext: {}
+      containerSecurityContext: {}
     service:
       annotations: {}
       labels: {}
@@ -288,6 +283,12 @@ controlPlane:
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
     spec:
       tls: []
+
+  standalone:
+    dataDir: "/var/lib/vcluster"
+    bundleRepository: "https://github.com/loft-sh/kubernetes/releases/download"
+    joinNode:
+      enabled: true
 
   statefulSet:
     labels: {}
@@ -391,8 +392,42 @@ controlPlane:
       labels: {}
       annotations: {}
 
+    konnectivity:
+      server:
+        enabled: true
+        extraArgs: []
+      agent:
+        enabled: true
+        replicas: 1
+        image: ""
+        imagePullPolicy: ""
+        nodeSelector: {}
+        tolerations: []
+        extraEnv: []
+        extraArgs: []
+
     globalMetadata:
       annotations: {}
+
+privateNodes:
+  enabled: false
+  importNodeBinaries: true
+  autoUpgrade:
+    enabled: true
+    concurrency: 1
+  localPathProvisioner:
+    enabled: true
+  cni:
+    flannel:
+      enabled: true
+  kubeProxy:
+    enabled: true
+    image: ""
+    imagePullPolicy: ""
+    nodeSelector: {}
+    tolerations: []
+    extraEnv: []
+    extraArgs: []
 
 integrations:
   metricsServer:
@@ -464,6 +499,7 @@ rbac:
     extraRules: []
 
 networking:
+  podCIDR: "10.244.0.0/16"
   replicateServices:
     toHost: []
     fromHost: []
@@ -554,12 +590,7 @@ external: {}
 plugins: {}
 
 experimental:
-  multiNamespaceMode:
-    enabled: false
-
   syncSettings:
-    disableSync: false
-    rewriteKubernetesService: false
     targetNamespace: ""
     setOwner: true
 
@@ -580,8 +611,6 @@ experimental:
       extraRules: []
     role:
       extraRules: []
-
-  reuseNamespace: false
 
 telemetry:
   enabled: true

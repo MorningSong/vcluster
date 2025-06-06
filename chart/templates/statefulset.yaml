@@ -105,10 +105,6 @@ spec:
           emptyDir: {}
         - name: certs
           emptyDir: {}
-        {{- if eq (include "vcluster.distro" .) "k0s" }}
-        - name: run-k0s
-          emptyDir: {}
-        {{- end }}
         {{- if eq (include "vcluster.distro" .) "k3s" }}
         - name: k3s-config
           emptyDir: {}
@@ -116,11 +112,6 @@ spec:
         - name: vcluster-config
           secret:
             secretName: vc-config-{{ .Release.Name }}
-        {{- if .Values.controlPlane.coredns.enabled }}
-        - name: coredns
-          configMap:
-            name: vc-coredns-{{ .Release.Name }}
-        {{- end }}
         {{- if .Values.controlPlane.statefulSet.persistence.dataVolume }}
 {{ toYaml .Values.controlPlane.statefulSet.persistence.dataVolume | indent 8 }}
         {{- else if not (include "vcluster.persistence.volumeClaim.enabled" .) }}
@@ -202,6 +193,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             {{- if .Values.controlPlane.statefulSet.env }}
 {{ toYaml .Values.controlPlane.statefulSet.env | indent 12 }}
             {{- end }}
@@ -216,23 +211,14 @@ spec:
               mountPath: /pki
             - name: helm-cache
               mountPath: /.cache/helm
-            {{- if eq (include "vcluster.distro" .) "k0s" }}
-            - name: run-k0s
-              mountPath: /run/k0s
-            {{- end }}
             {{- if eq (include "vcluster.distro" .) "k3s" }}
             - name: k3s-config
               mountPath: /etc/rancher
             {{- end }}
             - name: vcluster-config
-              mountPath: /var/vcluster
+              mountPath: /var/lib/vcluster
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.controlPlane.coredns.enabled }}
-            - name: coredns
-              mountPath: /manifests/coredns
-              readOnly: true
-            {{- end }}
             {{- if .Values.controlPlane.statefulSet.persistence.addVolumeMounts }}
 {{ toYaml .Values.controlPlane.statefulSet.persistence.addVolumeMounts | indent 12 }}
             {{- end }}
