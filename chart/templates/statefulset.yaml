@@ -105,10 +105,6 @@ spec:
           emptyDir: {}
         - name: certs
           emptyDir: {}
-        {{- if eq (include "vcluster.distro" .) "k0s" }}
-        - name: run-k0s
-          emptyDir: {}
-        {{- end }}
         {{- if eq (include "vcluster.distro" .) "k3s" }}
         - name: k3s-config
           emptyDir: {}
@@ -116,11 +112,6 @@ spec:
         - name: vcluster-config
           secret:
             secretName: vc-config-{{ .Release.Name }}
-        {{- if .Values.controlPlane.coredns.enabled }}
-        - name: coredns
-          configMap:
-            name: vc-coredns-{{ .Release.Name }}
-        {{- end }}
         {{- if .Values.controlPlane.statefulSet.persistence.dataVolume }}
 {{ toYaml .Values.controlPlane.statefulSet.persistence.dataVolume | indent 8 }}
         {{- else if not (include "vcluster.persistence.volumeClaim.enabled" .) }}
@@ -150,16 +141,16 @@ spec:
           args:
 {{ toYaml .Values.controlPlane.statefulSet.args | indent 12 }}
           {{- end }}
-          {{- if .Values.controlPlane.statefulSet.probes.livenessProbe.enabled }}
+         {{- if .Values.controlPlane.statefulSet.probes.livenessProbe.enabled }}
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8443
               scheme: HTTPS
-            failureThreshold: 60
-            initialDelaySeconds: 60
-            timeoutSeconds: 3
-            periodSeconds: 2
+            initialDelaySeconds: {{ .Values.controlPlane.statefulSet.probes.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controlPlane.statefulSet.probes.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.controlPlane.statefulSet.probes.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.controlPlane.statefulSet.probes.livenessProbe.failureThreshold }}
           {{- end }}
           {{- if .Values.controlPlane.statefulSet.probes.readinessProbe.enabled }}
           readinessProbe:
@@ -167,9 +158,9 @@ spec:
               path: /readyz
               port: 8443
               scheme: HTTPS
-            failureThreshold: 60
-            timeoutSeconds: 3
-            periodSeconds: 2
+            periodSeconds: {{ .Values.controlPlane.statefulSet.probes.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.controlPlane.statefulSet.probes.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.controlPlane.statefulSet.probes.readinessProbe.failureThreshold }}
           {{- end }}
           {{- if .Values.controlPlane.statefulSet.probes.startupProbe.enabled }}
           startupProbe:
@@ -177,9 +168,9 @@ spec:
               path: /readyz
               port: 8443
               scheme: HTTPS
-            failureThreshold: 300
-            timeoutSeconds: 3
-            periodSeconds: 6
+            periodSeconds: {{ .Values.controlPlane.statefulSet.probes.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.controlPlane.statefulSet.probes.startupProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.controlPlane.statefulSet.probes.startupProbe.failureThreshold }}
           {{- end }}
           {{- if .Values.controlPlane.statefulSet.security.containerSecurityContext }}
           securityContext:
@@ -190,6 +181,10 @@ spec:
           env:
             - name: VCLUSTER_NAME
               value: "{{ .Release.Name }}"
+            {{- if .Values.logging }}
+            - name: LOFT_LOG_ENCODING
+              value: {{ default "console" .Values.logging.encoding }}
+            {{- end }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
@@ -202,6 +197,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             {{- if .Values.controlPlane.statefulSet.env }}
 {{ toYaml .Values.controlPlane.statefulSet.env | indent 12 }}
             {{- end }}
@@ -216,23 +215,14 @@ spec:
               mountPath: /pki
             - name: helm-cache
               mountPath: /.cache/helm
-            {{- if eq (include "vcluster.distro" .) "k0s" }}
-            - name: run-k0s
-              mountPath: /run/k0s
-            {{- end }}
             {{- if eq (include "vcluster.distro" .) "k3s" }}
             - name: k3s-config
               mountPath: /etc/rancher
             {{- end }}
             - name: vcluster-config
-              mountPath: /var/vcluster
+              mountPath: /var/lib/vcluster
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.controlPlane.coredns.enabled }}
-            - name: coredns
-              mountPath: /manifests/coredns
-              readOnly: true
-            {{- end }}
             {{- if .Values.controlPlane.statefulSet.persistence.addVolumeMounts }}
 {{ toYaml .Values.controlPlane.statefulSet.persistence.addVolumeMounts | indent 12 }}
             {{- end }}
